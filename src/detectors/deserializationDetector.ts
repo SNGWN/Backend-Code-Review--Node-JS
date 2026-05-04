@@ -3,6 +3,8 @@ import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
+import { Logger } from '../utils/logger';
+import { hasValidationBoundary, isUntrustedInputText } from '../utils/detectorLogic';
 
 /**
  * Insecure Deserialization Detector
@@ -18,7 +20,7 @@ import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
  * @example
  * const detector = new DeserializationDetector('api.ts', sourceFile, parser);
  * const result = detector.detect();
- * console.log(result.findings); // Array of deserialization issues
+ * result.findings; // Array of deserialization issues
  */
 export class DeserializationDetector {
   private findings: Finding[] = [];
@@ -59,22 +61,6 @@ export class DeserializationDetector {
    * @private
    */
   private buildUntrustedVariableMap(): void {
-    const patterns = [
-      'body', 'query', 'params', 'headers', 'cookies',
-      'userInput', 'userData', 'data', 'payload'
-    ];
-
-    patterns.forEach(pattern => {
-      const accesses = ASTVisitor.findPropertyAccessExpression(this.sourceFile, pattern);
-      accesses.forEach(access => {
-        const varName = ASTVisitor.getIdentifierName(access);
-        if (varName) {
-          this.untrustedVariables.add(varName);
-        }
-      });
-    });
-
-    // Also find assignment from untrusted sources
     const assignments = ASTVisitor.findNodes(this.sourceFile, (node) => {
       return ts.isVariableDeclaration(node);
     });
@@ -83,12 +69,38 @@ export class DeserializationDetector {
       const varDecl = node as ts.VariableDeclaration;
       if (varDecl.initializer) {
         const text = varDecl.initializer.getText();
-        if (this.isUntrustedSource(text)) {
-          const varName = varDecl.name.getText();
-          this.untrustedVariables.add(varName);
+        if (isUntrustedInputText(text) || this.referencesUntrustedAlias(varDecl.initializer)) {
+          if (ts.isIdentifier(varDecl.name)) {
+            this.untrustedVariables.add(varDecl.name.text);
+            return;
+          }
+
+          if (ts.isObjectBindingPattern(varDecl.name)) {
+            varDecl.name.elements.forEach((element) => {
+              if (ts.isIdentifier(element.name)) {
+                this.untrustedVariables.add(element.name.text);
+              }
+            });
+          }
         }
       }
     });
+  }
+
+  private referencesUntrustedAlias(node: ts.Node): boolean {
+    const text = node.getText();
+    if (isUntrustedInputText(text)) {
+      return true;
+    }
+
+    for (const variable of this.untrustedVariables) {
+      const variablePattern = new RegExp(`\\b${variable}\\b`);
+      if (variablePattern.test(text)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -111,7 +123,7 @@ export class DeserializationDetector {
         const firstArg = callExpr.arguments[0];
         const argText = firstArg.getText();
 
-        if (this.isUntrustedInput(argText)) {
+        if (this.isUntrustedInput(argText) && !hasValidationBoundary(callExpr, this.sourceFile)) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
             category: 'VALIDATION',
@@ -152,7 +164,7 @@ export class DeserializationDetector {
         const firstArg = callExpr.arguments[0];
         const argText = firstArg.getText();
 
-        if (this.isUntrustedInput(argText)) {
+        if (this.isUntrustedInput(argText) && !hasValidationBoundary(callExpr, this.sourceFile)) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
             category: 'VALIDATION',
@@ -233,7 +245,7 @@ export class DeserializationDetector {
         for (let i = 1; i < callExpr.arguments.length; i++) {
           const sourceArg = callExpr.arguments[i].getText();
           
-          if (this.isUntrustedInput(sourceArg)) {
+          if (this.isUntrustedInput(sourceArg) && !hasValidationBoundary(callExpr, this.sourceFile)) {
             const { line, column } = this.parser.getLineAndColumn(node.getStart());
             const finding: Finding = {
               category: 'VALIDATION',
@@ -270,7 +282,7 @@ export class DeserializationDetector {
       const spreadExpr = node as ts.SpreadAssignment | ts.SpreadElement;
       const expressionText = spreadExpr.expression.getText();
 
-      if (this.isUntrustedInput(expressionText)) {
+        if (this.isUntrustedInput(expressionText) && !hasValidationBoundary(spreadExpr, this.sourceFile)) {
         // Check if spreading into an object
         const parent = spreadExpr.parent;
         if (parent && ts.isObjectLiteralExpression(parent)) {
@@ -327,7 +339,11 @@ export class DeserializationDetector {
         }
       });
 
-      if (hasUntrustedArg && gadgetPatterns.some(pattern => pattern.test(text))) {
+      if (
+        hasUntrustedArg &&
+        !hasValidationBoundary(callExpr, this.sourceFile) &&
+        gadgetPatterns.some(pattern => pattern.test(text))
+      ) {
         const { line, column } = this.parser.getLineAndColumn(node.getStart());
         const finding: Finding = {
           category: 'VALIDATION',
@@ -364,7 +380,7 @@ export class DeserializationDetector {
     }
 
     // Check for direct untrusted sources
-    return this.isUntrustedSource(text);
+    return isUntrustedInputText(text);
   }
 
   /**
@@ -374,26 +390,6 @@ export class DeserializationDetector {
    * @returns true if untrusted, false otherwise
    * @private
    */
-  private isUntrustedSource(text: string): boolean {
-    const untrustedPatterns = [
-      /req\.body/i,
-      /req\.query/i,
-      /req\.params/i,
-      /req\.headers/i,
-      /req\.cookies/i,
-      /userInput/i,
-      /userData/i,
-      /request\.body/i,
-      /request\.query/i,
-      /ctx\.request/i,
-      /Socket\.on\(/i,
-      /window\./i,
-      /document\./i,
-    ];
-
-    return untrustedPatterns.some(pattern => pattern.test(text));
-  }
-
   /**
    * Generates POC for deserialization vulnerability
    *
@@ -429,7 +425,7 @@ export class DeserializationDetector {
       // }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.debug(`POC generation failed: ${errorMessage}`);
+      Logger.debug('Deserialization POC generation failed', { error: errorMessage, line: finding.line });
     }
   }
 

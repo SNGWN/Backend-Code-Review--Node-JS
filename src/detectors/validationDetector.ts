@@ -5,6 +5,11 @@ import { ASTParser } from '../parser/astParser';
 import { StringHelper } from '../utils/helpers';
 import { InjectionPocGenerator } from '../poc/templates/InjectionPocGenerator';
 import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
+import { Logger } from '../utils/logger';
+import {
+  hasValidationBoundary,
+  isUntrustedInputText,
+} from '../utils/detectorLogic';
 
 /**
  * Parameter Validation Detector
@@ -20,7 +25,7 @@ import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
  * @example
  * const detector = new ParameterValidationDetector('routes.ts', sourceFile, parser);
  * const result = detector.detect();
- * console.log(result.findings); // Array of validation issues
+ * result.findings; // Array of validation issues
  */
 export class ParameterValidationDetector {
   private findings: Finding[] = [];
@@ -107,7 +112,7 @@ export class ParameterValidationDetector {
       }
 
       const initializerText = initializer.getText();
-      const isRequestSource = /req\.(body|params|query)\b/.test(initializerText);
+      const isRequestSource = isUntrustedInputText(initializerText);
       const isTaintedAlias = this.referencesTaintedInput(initializer);
 
       if (!isRequestSource && !isTaintedAlias) {
@@ -189,6 +194,18 @@ export class ParameterValidationDetector {
       };
     }
 
+    if (
+      /search/i.test(callName) &&
+      callExpr.arguments.some((arg) => /query|filter|term|search/i.test(arg.getText()))
+    ) {
+      return {
+        title: 'Unvalidated Input Reaches SQL Query Construction',
+        description: 'User-controlled search terms reach a backend query-construction helper without a visible allowlist or validation boundary. If the helper builds raw database predicates, this becomes directly exploitable.',
+        recommendation: 'Constrain searchable fields and operators through a server-side allowlist, and bind user values through parameterized query APIs instead of dynamic predicate construction.',
+        severity: 'CRITICAL',
+      };
+    }
+
     if (/exec|spawn|fork|execsync|spawnsync/i.test(callName)) {
       return {
         title: 'Unvalidated Input Reaches Command Execution',
@@ -216,22 +233,13 @@ export class ParameterValidationDetector {
       };
     }
 
-    if (/query/i.test(callText) && /\$\{/.test(callText)) {
-      return {
-        title: 'Unvalidated Input Reaches SQL Query Construction',
-        description: 'User-controlled input is interpolated into a raw SQL query. This is directly exploitable for SQL injection when the request value is attacker-controlled.',
-        recommendation: 'Use parameterized queries or ORM placeholders. Validate and constrain dynamic field names through a server-side allowlist.',
-        severity: 'CRITICAL',
-      };
-    }
-
     return null;
   }
 
   private referencesTaintedInput(node: ts.Node): boolean {
     const text = node.getText();
 
-    if (/req\.(body|params|query)\b/.test(text)) {
+    if (isUntrustedInputText(text)) {
       return true;
     }
 
@@ -265,15 +273,7 @@ export class ParameterValidationDetector {
    * @private
    */
   private hasValidationInContext(node: ts.Node): boolean {
-    const scopeText = node.getFullText().toLowerCase();
-    return (
-      StringHelper.isValidationLibraryCall(scopeText) ||
-      scopeText.includes('validate') ||
-      scopeText.includes('check') ||
-      scopeText.includes('schema') ||
-      scopeText.includes('allowlist') ||
-      scopeText.includes('whitelist')
-    );
+    return hasValidationBoundary(node, this.sourceFile);
   }
 
   /**
@@ -319,9 +319,8 @@ export class ParameterValidationDetector {
         finding.injectionType = injectionType;
       }
     } catch (error) {
-      // POC generation failed, continue without POC
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.debug(`POC generation failed: ${errorMessage}`);
+      Logger.debug('Validation POC generation failed', { error: errorMessage, line: finding.line });
     }
   }
 

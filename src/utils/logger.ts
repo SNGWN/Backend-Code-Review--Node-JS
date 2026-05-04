@@ -54,6 +54,10 @@ export class Logger {
   }
 
   static warn(message: string, meta?: LogMeta): void {
+    if (this.config.quiet) {
+      return;
+    }
+
     this.emit('warn', message, meta);
   }
 

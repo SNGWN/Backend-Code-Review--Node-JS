@@ -3,6 +3,11 @@ import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
+import {
+  getRouteHandlerContexts,
+  hasRateLimitProtection,
+  resolveRateLimitConfig,
+} from '../utils/detectorLogic';
 
 /**
  * Rate Limiting Bypass Detector
@@ -84,107 +89,60 @@ export class RateLimitDetector {
    * Detect missing rate limiting middleware on sensitive endpoints
    */
   private detectMissingRateLimitingMiddleware(): void {
-    const routeHandlers: Map<string, ts.Node> = new Map();
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
 
-    ASTVisitor.visit(this.sourceFile, (node: ts.Node) => {
-      if (ts.isCallExpression(node)) {
-        const callExpr = node as ts.CallExpression;
-        const expr = callExpr.expression;
-
-        // Look for route definitions like app.get(), app.post(), etc.
-        if (ts.isPropertyAccessExpression(expr)) {
-          const methodName = expr.name?.text;
-          const httpMethods = ['get', 'post', 'put', 'delete', 'patch'];
-
-          if (httpMethods.includes(methodName || '')) {
-            const firstArg = callExpr.arguments[0];
-            if (firstArg && ts.isStringLiteral(firstArg)) {
-              const path = firstArg.text;
-              routeHandlers.set(path, callExpr);
-            }
-          }
-        }
-      }
-    });
-
-    // Check if sensitive endpoints have rate limiting
-    for (const [path, node] of routeHandlers) {
-      if (this.isSensitiveEndpoint(path)) {
-        const hasRateLimit = this.checkForRateLimitMiddleware(node);
-
-        if (!hasRateLimit) {
-          const line = this.sourceFile.getLineAndCharacterOfPosition(node.pos).line + 1;
-          this.findings.push({
+    routes.forEach((route) => {
+      if (this.isSensitiveEndpoint(route.path) && !hasRateLimitProtection(route, this.sourceFile)) {
+        this.findings.push({
             category: 'RATE_LIMITING',
             severity: 'HIGH',
-            title: `Missing Rate Limiting on Sensitive Endpoint: ${path}`,
-            description: `The endpoint ${path} does not have rate limiting middleware configured. This endpoint is a common target for brute force and DoS attacks.`,
+            title: `Missing Rate Limiting on Sensitive Endpoint: ${route.path}`,
+            description: `The endpoint ${route.path} does not have rate limiting middleware configured. This endpoint is a common target for brute force and DoS attacks.`,
             file: this.filePath,
-            line,
+            line: route.line,
             column: 1,
-            code: node.getText(this.sourceFile).substring(0, 100),
-            recommendation: `Add rate limiting middleware using express-rate-limit with a maximum of 5-10 requests per minute for ${path}. Example: const limiter = rateLimit({ windowMs: 60 * 1000, max: 5 }); app.post('${path}', limiter, handler);`,
+            code: route.routeText.substring(0, 100),
+            recommendation: `Add rate limiting middleware using express-rate-limit with a maximum of 5-10 requests per minute for ${route.path}. Example: const limiter = rateLimit({ windowMs: 60 * 1000, max: 5 }); app.post('${route.path}', limiter, handler);`,
           });
 
-          this.generateMissingRateLimitPoc(path, line);
-        }
+        this.generateMissingRateLimitPoc(route.path, route.line);
       }
-    }
+    });
   }
 
   /**
    * Detect rate limit bypass via header manipulation
    */
   private detectHeaderBypassVulnerabilities(): void {
-    let hasUnprotectedHeaderAccess = false;
-    let line = 1;
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
 
-    ASTVisitor.visit(this.sourceFile, (node: ts.Node) => {
-      // Look for req.ip usage without proper validation
-      if (ts.isPropertyAccessExpression(node)) {
-        const expr = node as ts.PropertyAccessExpression;
-        const prop = expr.name?.text;
+    routes.forEach((route) => {
+      for (const middleware of route.middlewares) {
+        const config = resolveRateLimitConfig(middleware, this.sourceFile);
+        if (!config) {
+          continue;
+        }
 
-        if (prop === 'ip') {
-          const parent = expr.expression;
-          if (parent && ts.isIdentifier(parent)) {
-            const parentName = parent.getText(this.sourceFile);
-            if (parentName === 'req') {
-              line = this.sourceFile.getLineAndCharacterOfPosition(node.pos).line + 1;
-              const parentNode = node.parent;
-              const parentText = parentNode?.getText(this.sourceFile) || '';
+        if (config.usesReqIpKey && !config.hasTrustedProxyProtection) {
+          this.findings.push({
+            category: 'RATE_LIMITING',
+            severity: 'HIGH',
+            title: 'Rate Limit Bypass via Header Manipulation',
+            description:
+              'The rate limit key generator relies on request IP data without visible trusted-proxy validation. Attackers can spoof forwarding headers to bypass IP-based rate limits.',
+            file: this.filePath,
+            line: route.line,
+            column: 1,
+            code: route.routeText.substring(0, 140),
+            recommendation:
+              'Only trust proxy headers from your own infrastructure and derive the client IP through a trusted helper before using it in keyGenerator.',
+          });
 
-              // Check if used directly without validation
-              if (
-                !parentText.includes('trustedProxies') &&
-                !parentText.includes('trust') &&
-                !parentText.includes('isInternalNetwork')
-              ) {
-                hasUnprotectedHeaderAccess = true;
-              }
-            }
-          }
+          this.generateHeaderBypassPoc(route.line);
+          return;
         }
       }
     });
-
-    if (hasUnprotectedHeaderAccess) {
-      this.findings.push({
-        category: 'RATE_LIMITING',
-        severity: 'HIGH',
-        title: 'Rate Limit Bypass via Header Manipulation',
-        description:
-          'The IP address is extracted from req.ip without proper validation of trusted proxies. Attackers can spoof their IP address using X-Forwarded-For or similar headers to bypass rate limiting.',
-        file: this.filePath,
-        line,
-        column: 1,
-        code: 'req.ip usage without proxy validation',
-        recommendation:
-          'Configure express-rate-limit with proper trust proxy settings: rateLimit({ skip: (req) => !isInternalNetwork(req.ip), keyGenerator: (req) => getClientIp(req) }). Only trust proxies from your infrastructure.',
-      });
-
-      this.generateHeaderBypassPoc(line);
-    }
   }
 
   /**
@@ -249,60 +207,39 @@ export class RateLimitDetector {
    * Detect weak rate limits on sensitive endpoints
    */
   private detectWeakRateLimits(): void {
-    ASTVisitor.visit(this.sourceFile, (node: ts.Node) => {
-      if (ts.isObjectLiteralExpression(node)) {
-        const obj = node as ts.ObjectLiteralExpression;
-        let maxRequests = 0;
-        let windowMs = 60000; // default to 1 minute
-        let isSensitiveEndpoint = false;
-        let line = this.sourceFile.getLineAndCharacterOfPosition(node.pos).line + 1;
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
 
-        // Analyze object properties
-        for (const prop of obj.properties) {
-          if (ts.isPropertyAssignment(prop)) {
-            const propName = prop.name?.getText(this.sourceFile) || '';
-            const propValue = prop.initializer?.getText(this.sourceFile) || '';
+    routes.forEach((route) => {
+      if (!this.isHighRiskRateLimitTarget(route.path)) {
+        return;
+      }
 
-            if (propName === 'max') {
-              maxRequests = parseInt(propValue) || 100;
-            } else if (propName === 'windowMs') {
-              windowMs = parseInt(propValue) || 60000;
-            }
-          }
+      route.middlewares.forEach((middleware) => {
+        const config = resolveRateLimitConfig(middleware, this.sourceFile);
+        if (!config?.maxRequests || !config.windowMs) {
+          return;
         }
 
-        // Check if this is a sensitive endpoint
-        const parentText = node.parent?.getText(this.sourceFile) || '';
-        for (const endpoint of this.sensitiveEndpoints) {
-          if (parentText.includes(endpoint)) {
-            isSensitiveEndpoint = true;
-            break;
-          }
+        if (config.usesReqIpKey && !config.hasTrustedProxyProtection) {
+          return;
         }
 
-        // Calculate requests per minute
-        const requestsPerMinute = (maxRequests * 60000) / windowMs;
-
-        if (
-          isSensitiveEndpoint &&
-          requestsPerMinute > 10
-        ) {
+        const requestsPerMinute = (config.maxRequests * 60000) / config.windowMs;
+        if (requestsPerMinute > 10) {
           this.findings.push({
             category: 'RATE_LIMITING',
             severity: 'HIGH',
             title: 'Weak Rate Limiting on Sensitive Endpoint',
             description: `Rate limit of ${requestsPerMinute.toFixed(1)} requests per minute is too high for a sensitive endpoint. This allows brute force attacks with reasonable throughput.`,
             file: this.filePath,
-            line,
+            line: route.line,
             column: 1,
-            code: node.getText(this.sourceFile),
+            code: route.routeText.substring(0, 160),
             recommendation:
               'Reduce rate limits on sensitive endpoints to 5-10 requests per minute: { windowMs: 60000, max: 5 }',
           });
-
-          // this.generateWeakLimitPoc(line, requestsPerMinute);
         }
-      }
+      });
     });
   }
 
@@ -310,61 +247,32 @@ export class RateLimitDetector {
    * Detect distributed rate limit bypass opportunities
    */
   private detectDistributedBypassOpportunities(): void {
-    let usesMemoryStore = false;
-    let isDistributed = false;
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
 
-    ASTVisitor.visit(this.sourceFile, (node: ts.Node) => {
-      const text = node.getText(this.sourceFile);
-
-      if (
-        text.includes('store:') ||
-        text.includes('memory') ||
-        text.includes('MemoryStore')
-      ) {
-        usesMemoryStore = true;
+    routes.forEach((route) => {
+      if (!this.isSensitiveEndpoint(route.path)) {
+        return;
       }
 
-      if (
-        text.includes('redis') ||
-        text.includes('memcached') ||
-        text.includes('RedisStore')
-      ) {
-        isDistributed = true;
-      }
-    });
-
-    if (usesMemoryStore && !isDistributed) {
-      this.findings.push({
-        category: 'RATE_LIMITING',
-        severity: 'HIGH',
-        title: 'Distributed Rate Limit Bypass via Load Balancer',
-        description:
-          'Rate limiting uses in-memory storage, which is not shared across multiple server instances. An attacker can distribute requests across load-balanced servers to bypass rate limits.',
-        file: this.filePath,
-        line: 1,
-        column: 1,
-        code: 'rateLimit({ store: new MemoryStore() })',
-        recommendation:
-          'Use a distributed cache backend for rate limiting: rateLimit({ store: new RedisStore({ client: redisClient }) }). Ensure all instances share the same rate limit state.',
+      route.middlewares.forEach((middleware) => {
+        const config = resolveRateLimitConfig(middleware, this.sourceFile);
+        if (config?.usesMemoryStore && !config.usesDistributedStore) {
+          this.findings.push({
+            category: 'RATE_LIMITING',
+            severity: 'HIGH',
+            title: 'Distributed Rate Limit Bypass via Load Balancer',
+            description:
+              'Rate limiting uses in-memory storage, which is not shared across multiple server instances. An attacker can distribute requests across load-balanced servers to bypass rate limits.',
+            file: this.filePath,
+            line: route.line,
+            column: 1,
+            code: route.routeText.substring(0, 160),
+            recommendation:
+              'Use a distributed cache backend for rate limiting: rateLimit({ store: new RedisStore({ client: redisClient }) }). Ensure all instances share the same rate limit state.',
+          });
+        }
       });
-
-      // this.generateDistributedBypassPoc(1);
-    }
-  }
-
-  /**
-   * Check if a route handler has rate limit middleware
-   */
-  private checkForRateLimitMiddleware(node: ts.Node): boolean {
-    const text = node.getText(this.sourceFile);
-
-    for (const pattern of this.rateLimitPatterns) {
-      if (text.toLowerCase().includes(pattern.toLowerCase())) {
-        return true;
-      }
-    }
-
-    return false;
+    });
   }
 
   /**
@@ -377,6 +285,10 @@ export class RateLimitDetector {
       }
       return path === endpoint || path.startsWith(endpoint);
     });
+  }
+
+  private isHighRiskRateLimitTarget(path: string): boolean {
+    return /(login|auth|admin|password|secret|key)/i.test(path);
   }
 
   /**

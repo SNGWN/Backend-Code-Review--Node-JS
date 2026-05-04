@@ -5,6 +5,7 @@ import { ASTParser } from '../parser/astParser';
 import { StringHelper } from '../utils/helpers';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
+import { Logger } from '../utils/logger';
 
 /**
  * Business Logic Flaw Detector
@@ -22,7 +23,7 @@ import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
  * @example
  * const detector = new BusinessLogicDetector('payment.ts', sourceFile, parser);
  * const result = detector.detect();
- * console.log(result.findings); // Array of business logic flaws
+ * result.findings; // Array of business logic flaws
  */
 export class BusinessLogicDetector {
   private findings: Finding[] = [];
@@ -83,7 +84,8 @@ export class BusinessLogicDetector {
         const filePath = PocMarkdownReportGenerator.savePocReport(poc, outputDir);
         exportedFiles.push(filePath);
       } catch (error) {
-        console.error(`Failed to export POC ${poc.id}: ${error}`);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        Logger.error(`Failed to export POC ${poc.id}`, { error: errorMessage });
       }
     });
 

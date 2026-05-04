@@ -5,6 +5,15 @@ import { ASTParser } from '../parser/astParser';
 import { StringHelper } from '../utils/helpers';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { Logger } from '../utils/logger';
+import {
+  getEnclosingScopeText,
+  getRouteHandlerContexts,
+  hasAuthorizationProtection,
+  hasOwnershipCheck,
+  isSensitiveRouteContext,
+  isUserControlledExpression,
+} from '../utils/detectorLogic';
 
 /**
  * Access Control Detector
@@ -69,7 +78,8 @@ export class AccessControlDetector {
         const filePath = PocMarkdownReportGenerator.savePocReport(poc, outputDir);
         exportedFiles.push(filePath);
       } catch (error) {
-        console.error(`Failed to export POC ${poc.id}: ${error}`);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        Logger.error(`Failed to export POC ${poc.id}`, { error: errorMessage });
       }
     });
 
@@ -80,54 +90,27 @@ export class AccessControlDetector {
    * Detects routes/endpoints missing authorization checks
    */
   private detectMissingAuthorizationChecks(): void {
-    const routeHandlers = ASTVisitor.findNodes(this.sourceFile, (node) => {
-      if (ts.isCallExpression(node)) {
-        const name = ASTVisitor.getCallExpressionName(node);
-        return (
-          name === 'get' ||
-          name === 'post' ||
-          name === 'put' ||
-          name === 'delete' ||
-          name === 'patch'
-        );
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
+
+    routes.forEach((route) => {
+      if (!isSensitiveRouteContext(route) || hasAuthorizationProtection(route)) {
+        return;
       }
-      return false;
-    });
 
-    routeHandlers.forEach((node) => {
-      const callExpr = node as ts.CallExpression;
-      const args = callExpr.arguments;
+      const finding: Finding = {
+        category: 'ACCESS_CONTROL',
+        severity: 'HIGH',
+        title: 'Missing Authorization Check on Sensitive Endpoint',
+        description: `Route '${route.path}' handles a sensitive action but no role, permission, or ownership guard is visible in middleware or handler logic.`,
+        file: this.filePath,
+        line: route.line,
+        column: 1,
+        code: route.routeText.substring(0, 100),
+        recommendation: 'Add authorization middleware or inline ownership/role checks before executing sensitive route logic.',
+      };
 
-      if (args.length >= 2) {
-        const routePath = args[0]?.getText() || '';
-        const isSensitiveRoute = /admin|user|profile|delete|update|settings|payment|order|invoice/i.test(routePath);
-
-        if (isSensitiveRoute) {
-          const hasAuthz = args.some((arg, index) => {
-            if (index === args.length - 1) return false;
-            const argName = ASTVisitor.getIdentifierName(arg)?.toLowerCase() || '';
-            return /authz|authorization|auth|permission|role|authorize|check.*permission/i.test(argName);
-          });
-
-          if (!hasAuthz) {
-            const { line, column } = this.parser.getLineAndColumn(node.getStart());
-            const finding: Finding = {
-              category: 'ACCESS_CONTROL',
-              severity: 'HIGH',
-              title: 'Missing Authorization Check on Sensitive Endpoint',
-              description: `Route '${routePath}' handles sensitive operations but lacks authorization middleware. Verify that only authorized users can access this endpoint.`,
-              file: this.filePath,
-              line,
-              column,
-              code: node.getText().substring(0, 60),
-              recommendation: 'Add authorization middleware to verify user roles/permissions before allowing access to sensitive endpoints.',
-            };
-
-            this.findings.push(finding);
-            this.generateAccessControlPoc(finding, node.getText(), line);
-          }
-        }
-      }
+      this.findings.push(finding);
+      this.generateAccessControlPoc(finding, route.routeText, route.line);
     });
   }
 
@@ -146,15 +129,15 @@ export class AccessControlDetector {
     parameterAccess.forEach((node) => {
       const parentText = node.parent?.getText().toLowerCase() || '';
       const nodeText = node.getText().toLowerCase();
-      const context = this.getContextAroundNode(node);
+      const context = getEnclosingScopeText(node, this.sourceFile);
       const isResourceLookupContext = /(findbyid|getbyid|findone|where|query|delete|update|select)/.test(context);
 
       // Check if the ID is used directly without ownership verification
-      const hasOwnershipCheck = this.hasOwnershipValidation(context);
+      const hasOwnershipGuard = hasOwnershipCheck(context);
 
       if (
         isResourceLookupContext &&
-        !hasOwnershipCheck &&
+        !hasOwnershipGuard &&
         (nodeText.includes('userid') || nodeText.includes('orderid') || nodeText.includes('invoiceid'))
       ) {
         const { line, column } = this.parser.getLineAndColumn(node.getStart());
@@ -190,14 +173,11 @@ export class AccessControlDetector {
 
     dbQueries.forEach((node) => {
       const text = node.getText();
-      const parent = node.parent?.getText().toLowerCase() || '';
+      const parent = getEnclosingScopeText(node, this.sourceFile);
 
       // If ID is passed but no user/owner check
       if (/id|req\.params|req\.body|req\.query/i.test(text)) {
-        const hasOwnerVerification = (
-          (parent.includes('req.user') || parent.includes('currentuser')) &&
-          (parent.includes('owner') || parent.includes('userid') || parent.includes('user_id'))
-        ) || text.toLowerCase().includes('owner');
+        const hasOwnerVerification = hasOwnershipCheck(parent) || text.toLowerCase().includes('owner');
 
         if (!hasOwnerVerification && parent.length > 20) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
@@ -232,12 +212,7 @@ export class AccessControlDetector {
 
       // Check for admin/sensitive functions without proper role checks
       if (/admin|delete|update|settings|permissions|role|assign/i.test(funcName)) {
-        const hasRoleCheck = funcText.includes('admin') && (
-          funcText.includes('role') ||
-          funcText.includes('permission') ||
-          funcText.includes('isadmin') ||
-          funcText.includes('authorize')
-        );
+        const hasRoleCheck = hasAuthorizationProtection(funcText);
 
         if (!hasRoleCheck) {
           const { line, column } = this.parser.getLineAndColumn(func.getStart());
@@ -280,7 +255,7 @@ export class AccessControlDetector {
       
       if (args.length > 0) {
         const firstArg = args[0];
-        const isUserInput = this.isUserControlledIdExpression(firstArg);
+        const isUserInput = isUserControlledExpression(firstArg, this.sourceFile);
 
         if (isUserInput) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
@@ -376,35 +351,10 @@ export class AccessControlDetector {
     this.generatedPocs.push(poc);
   }
 
-  private isUserControlledIdExpression(expression: ts.Expression): boolean {
-    const text = expression.getText().toLowerCase();
-    if (/req\.|params|query|body/.test(text)) {
-      return true;
-    }
-
-    if (ts.isIdentifier(expression)) {
-      const identifier = expression.text;
-      const declarations = ASTVisitor.findVariableDeclarations(this.sourceFile, identifier);
-      return declarations.some((decl) => {
-        const initText = decl.initializer?.getText().toLowerCase() || '';
-        return /req\.(params|query|body)\./.test(initText);
-      });
-    }
-
-    return false;
-  }
-
   private getContextAroundNode(node: ts.Node, padding: number = 220): string {
     const source = this.sourceFile.getFullText().toLowerCase();
     const start = Math.max(0, node.getStart() - padding);
     const end = Math.min(source.length, node.getEnd() + padding);
     return source.substring(start, end);
-  }
-
-  private hasOwnershipValidation(context: string): boolean {
-    return (
-      /req\.user/.test(context) &&
-      /(owner|userid|user_id|accountid|tenantid|organizationid|orgid)/.test(context)
-    ) || /(authorize|permission|isadmin|hasrole|canaccess|forbidden|403)/.test(context);
   }
 }

@@ -4,6 +4,7 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept } from '../poc/types';
+import { Logger } from '../utils/logger';
 
 /**
  * API Key/Secrets Exposure Detector
@@ -99,7 +100,7 @@ export class ApiKeyDetector {
         exportedFiles.push(filePath);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        console.error(`Failed to export POC: ${errorMessage}`);
+        Logger.error('Failed to export POC', { error: errorMessage });
       }
     });
 

@@ -7,6 +7,12 @@ import { HTTP_METHODS, AUTH_VERIFICATION_FUNCTIONS, DETECTOR_LOGIC_STRINGS } fro
 import { HardcodedSecretPocGenerator } from '../poc/templates/HardcodedSecretPocGenerator';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { Logger } from '../utils/logger';
+import {
+  getRouteHandlerContexts,
+  hasAuthenticationProtection,
+  isSensitiveRouteContext,
+} from '../utils/detectorLogic';
 
 /**
  * Authentication Detector
@@ -19,7 +25,7 @@ import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc
  * @example
  * const detector = new AuthenticationDetector('auth.ts', sourceFile, parser);
  * const result = detector.detect();
- * console.log(result.findings); // Array of authentication issues
+ * result.findings; // Array of authentication issues
  */
 export class AuthenticationDetector {
   private findings: Finding[] = [];
@@ -75,7 +81,8 @@ export class AuthenticationDetector {
         const filePath = PocMarkdownReportGenerator.savePocReport(poc, outputDir);
         exportedFiles.push(filePath);
       } catch (error) {
-        console.error(`Failed to export POC ${poc.id}: ${error}`);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        Logger.error(`Failed to export POC ${poc.id}`, { error: errorMessage });
       }
     });
 
@@ -212,36 +219,24 @@ export class AuthenticationDetector {
   }
 
   private detectMissingAuthGuards(): void {
-    const functions = ASTVisitor.findFunctionDeclarations(this.sourceFile);
+    const routes = getRouteHandlerContexts(this.sourceFile, this.parser);
 
-    functions.forEach((func) => {
-      const functionText = func.getText().toLowerCase();
-
-      if (
-        functionText.includes('delete') ||
-        functionText.includes('admin') ||
-        functionText.includes('private')
-      ) {
-        const hasAuthGuard = functionText.includes('auth') ||
-          functionText.includes('verify') ||
-          functionText.includes('permission') ||
-          functionText.includes('role');
-
-        if (!hasAuthGuard) {
-          const { line, column } = this.parser.getLineAndColumn(func.getStart());
-          this.findings.push({
-            category: 'AUTHENTICATION',
-            severity: 'HIGH',
-            title: 'Sensitive Function Without Auth Guard',
-            description: `Function '${func.name?.text}' performs sensitive operations without authentication checks.`,
-            file: this.filePath,
-            line,
-            column,
-            code: func.getText().substring(0, 50),
-            recommendation: 'Add authentication and authorization checks to sensitive functions.',
-          });
-        }
+    routes.forEach((route) => {
+      if (!isSensitiveRouteContext(route) || hasAuthenticationProtection(route)) {
+        return;
       }
+
+      this.findings.push({
+        category: 'AUTHENTICATION',
+        severity: 'HIGH',
+        title: 'Sensitive Function Without Auth Guard',
+        description: `Route '${route.path}' performs sensitive operations without authentication checks.`,
+        file: this.filePath,
+        line: route.line,
+        column: 1,
+        code: route.routeText.substring(0, 100),
+        recommendation: 'Add authentication middleware or verified identity checks before executing sensitive route logic.',
+      });
     });
   }
 
@@ -317,12 +312,13 @@ export class AuthenticationDetector {
       if (result.success && result.poc) {
         // Store the generated POC
         this.generatedPocs.push(result.poc);
-        console.log(`  ✓ POC generated for hardcoded secret at line ${line}`);
+        Logger.success(`POC generated for hardcoded secret at line ${line}`);
       } else {
-        console.warn(`  ⚠️  Failed to generate POC: ${result.error}`);
+        Logger.warn('Failed to generate hardcoded secret POC', { error: result.error, line });
       }
     } catch (error) {
-      console.error(`  ✗ Error generating POC for hardcoded secret: ${error}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      Logger.error('Error generating POC for hardcoded secret', { error: errorMessage, line });
     }
   }
 }

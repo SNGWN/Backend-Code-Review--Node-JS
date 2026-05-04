@@ -4,6 +4,8 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { Logger } from '../utils/logger';
+import { getEnclosingScopeText } from '../utils/detectorLogic';
 
 /**
  * JWT Token Validation Bypass Detector
@@ -68,7 +70,8 @@ export class JwtBypassDetector {
         const filePath = PocMarkdownReportGenerator.savePocReport(poc, outputDir);
         exportedFiles.push(filePath);
       } catch (error) {
-        console.error(`Failed to export POC ${poc.id}: ${error}`);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        Logger.error(`Failed to export POC ${poc.id}`, { error: errorMessage });
       }
     });
 
@@ -95,10 +98,9 @@ export class JwtBypassDetector {
     });
 
     decodeNodes.forEach((node) => {
-      const callExpr = node as ts.CallExpression;
       const position = this.sourceFile.getLineAndCharacterOfPosition(node.getStart());
       const line = position.line + 1;
-      const code = this.getCodeSnippet(line);
+      const code = getEnclosingScopeText(node, this.sourceFile);
 
       // Check if there's corresponding verify call
       if (!this.hasVerifyCall(code)) {
@@ -324,8 +326,8 @@ export class JwtBypassDetector {
       const line = position.line + 1;
       const code = this.getCodeSnippet(line);
 
-      if (callExpr.arguments.length > 1) {
-        const optionsArg = callExpr.arguments[1];
+      if (callExpr.arguments.length > 2) {
+        const optionsArg = callExpr.arguments[2];
         const optionsText = optionsArg.getText();
 
         // Check if ignoreExpiration is set to true or if no ignoreExpiration check
@@ -412,16 +414,12 @@ export class JwtBypassDetector {
     });
 
     verifyNodes.forEach((node) => {
-      const callExpr = node as ts.CallExpression;
       const position = this.sourceFile.getLineAndCharacterOfPosition(node.getStart());
       const line = position.line + 1;
-      const code = this.getCodeSnippet(line);
+      const code = getEnclosingScopeText(node, this.sourceFile);
 
       // Check if kid claim is validated
-      if (callExpr.arguments.length > 0) {
-        const firstArg = callExpr.arguments[0];
-        const tokenText = firstArg.getText();
-
+      if ((node as ts.CallExpression).arguments.length > 0) {
         // Check if kid validation is missing
         if (!this.hasKidValidation(code)) {
           const finding: Finding = {
@@ -450,7 +448,7 @@ export class JwtBypassDetector {
    * Helper: Check if code has jwt.verify() call
    */
   private hasVerifyCall(code: string): boolean {
-    return /jwt\.verify|JWT\.verify|\.verify\(|verifyToken|validateToken/.test(code);
+    return /jwt\.verify|JWT\.verify|verifyToken|validateToken|passport\.authenticate|authmiddleware|requireauth|ensureauth/.test(code);
   }
 
   /**

@@ -4,6 +4,7 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { MassAssignmentPocGenerator } from '../poc/templates/MassAssignmentPocGenerator';
 import { PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { Logger } from '../utils/logger';
 
 export class MassAssignmentDetector {
   private findings: Finding[] = [];
@@ -268,7 +269,10 @@ export class MassAssignmentDetector {
       return result.success ? result.poc : null;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`Failed to generate POC for mass assignment finding: ${errorMessage}`);
+      Logger.error('Failed to generate POC for mass assignment finding', {
+        error: errorMessage,
+        line,
+      });
       return null;
     }
   }
