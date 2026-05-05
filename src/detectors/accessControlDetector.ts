@@ -2,9 +2,8 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { StringHelper } from '../utils/helpers';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
-import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
 import {
   getEnclosingScopeText,
@@ -127,7 +126,6 @@ export class AccessControlDetector {
     });
 
     parameterAccess.forEach((node) => {
-      const parentText = node.parent?.getText().toLowerCase() || '';
       const nodeText = node.getText().toLowerCase();
       const context = getEnclosingScopeText(node, this.sourceFile);
       const isResourceLookupContext = /(findbyid|getbyid|findone|where|query|delete|update|select)/.test(context);
@@ -349,12 +347,5 @@ export class AccessControlDetector {
     };
 
     this.generatedPocs.push(poc);
-  }
-
-  private getContextAroundNode(node: ts.Node, padding: number = 220): string {
-    const source = this.sourceFile.getFullText().toLowerCase();
-    const start = Math.max(0, node.getStart() - padding);
-    const end = Math.min(source.length, node.getEnd() + padding);
-    return source.substring(start, end);
   }
 }

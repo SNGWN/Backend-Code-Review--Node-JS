@@ -5,6 +5,11 @@ import { ASTParser } from '../parser/astParser';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
+import {
+  isEnumLikeLiteral,
+  isPathLikeLiteral,
+  isStringLiteralInMetadataContext,
+} from '../utils/detectorLogic';
 
 /**
  * API Key/Secrets Exposure Detector
@@ -27,6 +32,8 @@ export class ApiKeyDetector {
   private sourceFile: ts.SourceFile;
   private parser: ASTParser;
   private generatedPocs: ProofOfConcept[] = [];
+  private readonly GENERIC_CREDENTIAL_NAME_PATTERN =
+    /(api[_-]?key|apikey|secret|private[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|password)/i;
 
   // API Key patterns for various services
   private readonly API_KEY_PATTERNS = {
@@ -117,16 +124,20 @@ export class ApiKeyDetector {
     );
 
     stringLiterals.forEach((node) => {
-      const text = (node as ts.StringLiteral).text;
+      const stringLiteral = node as ts.StringLiteral;
+      const text = stringLiteral.text;
       const { line, column } = this.parser.getLineAndColumn(node.getStart());
 
-      // Skip if in detector logic
-      if (this.isDetectorLogicString(line, text)) {
+      if (this.shouldIgnoreStringLiteral(stringLiteral, text)) {
         return;
       }
 
       // Check against known service patterns
       for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
+        if (serviceName.startsWith('generic_') && !this.isLikelyGenericCredential(stringLiteral, text)) {
+          continue;
+        }
+
         if (pattern.test(text)) {
           const serviceType = this.extractServiceType(serviceName);
           const severity = this.isTestEnvironment() ? 'HIGH' : 'CRITICAL';
@@ -246,7 +257,7 @@ export class ApiKeyDetector {
       const lineNumber = index + 1;
       
       // Skip detector logic lines
-      if (this.isDetectorLogicString(lineNumber, line)) {
+      if (this.isDetectorLogicString(line)) {
         return;
       }
 
@@ -256,20 +267,22 @@ export class ApiKeyDetector {
                                       line.indexOf('/*') > -1 ? line.indexOf('/*') : 0);
         
         for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
-          if (pattern.test(comment)) {
-            this.findings.push({
-              category: 'API_KEY_EXPOSURE',
-              severity: 'HIGH',
-              title: `${this.extractServiceType(serviceName)} Key in Comment`,
-              description: 'API key is exposed in code comment. Comments are included in source code and version control.',
-              file: this.filePath,
-              line: lineNumber,
-              column: line.indexOf('//') > -1 ? line.indexOf('//') : line.indexOf('/*'),
-              code: comment.substring(0, 60),
-              recommendation: 'Remove all credentials from comments. Use environment variables or secrets managers.',
-            });
-            break;
+          if (!this.matchesCredentialText(comment, serviceName, pattern)) {
+            continue;
           }
+
+          this.findings.push({
+            category: 'API_KEY_EXPOSURE',
+            severity: 'HIGH',
+            title: `${this.extractServiceType(serviceName)} Key in Comment`,
+            description: 'API key is exposed in code comment. Comments are included in source code and version control.',
+            file: this.filePath,
+            line: lineNumber,
+            column: line.indexOf('//') > -1 ? line.indexOf('//') : line.indexOf('/*'),
+            code: comment.substring(0, 60),
+            recommendation: 'Remove all credentials from comments. Use environment variables or secrets managers.',
+          });
+          break;
         }
       }
     });
@@ -294,24 +307,22 @@ export class ApiKeyDetector {
           const argText = arg.getText();
           const { line, column } = this.parser.getLineAndColumn(arg.getStart());
 
-          // Check if logging includes API key patterns
-          for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
-            if (pattern.test(argText)) {
-              this.findings.push({
-                category: 'API_KEY_EXPOSURE',
-                severity: 'CRITICAL',
-                title: `${this.extractServiceType(serviceName)} Key in Logs`,
-                description: 'API key is being logged. Logs may be stored, transmitted, and accessed by multiple parties.',
-                file: this.filePath,
-                line,
-                column,
-                code: argText.substring(0, 60),
-                recommendation: 'Remove credentials from log output. Implement logging filters or use a logging library that strips sensitive data.',
-              });
-
-              break;
-            }
+          const serviceName = this.getLoggedCredentialServiceName(arg);
+          if (!serviceName) {
+            return;
           }
+
+          this.findings.push({
+            category: 'API_KEY_EXPOSURE',
+            severity: 'CRITICAL',
+            title: `${this.extractServiceType(serviceName)} Key in Logs`,
+            description: 'API key is being logged. Logs may be stored, transmitted, and accessed by multiple parties.',
+            file: this.filePath,
+            line,
+            column,
+            code: argText.substring(0, 60),
+            recommendation: 'Remove credentials from log output. Implement logging filters or use a logging library that strips sensitive data.',
+          });
         });
       }
     });
@@ -335,20 +346,22 @@ export class ApiKeyDetector {
       
       if (isErrorMessage) {
         for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
-          if (pattern.test(text)) {
-            this.findings.push({
-              category: 'API_KEY_EXPOSURE',
-              severity: 'HIGH',
-              title: `${this.extractServiceType(serviceName)} Key in Error Message`,
-              description: 'API key exposed in error message. Errors are often logged and displayed to users.',
-              file: this.filePath,
-              line,
-              column,
-              code: text.substring(0, 60),
-              recommendation: 'Remove sensitive data from error messages. Log full errors internally but show sanitized messages to users.',
-            });
-            break;
+          if (!this.matchesCredentialText(text, serviceName, pattern)) {
+            continue;
           }
+
+          this.findings.push({
+            category: 'API_KEY_EXPOSURE',
+            severity: 'HIGH',
+            title: `${this.extractServiceType(serviceName)} Key in Error Message`,
+            description: 'API key exposed in error message. Errors are often logged and displayed to users.',
+            file: this.filePath,
+            line,
+            column,
+            code: text.substring(0, 60),
+            recommendation: 'Remove sensitive data from error messages. Log full errors internally but show sanitized messages to users.',
+          });
+          break;
         }
       }
     });
@@ -412,9 +425,8 @@ export class ApiKeyDetector {
   /**
    * Helper: Check if string is from detector logic
    */
-  private isDetectorLogicString(line: number, text: string): boolean {
-    const detectorLines = /API_KEY_PATTERNS|detectHardcodedApiKeys|isDetectorLogic/;
-    return detectorLines.test(text) || (line >= 35 && line <= 60);
+  private isDetectorLogicString(text: string): boolean {
+    return /API_KEY_PATTERNS|detectHardcodedApiKeys|isDetectorLogic|extractServiceType/.test(text);
   }
 
   /**
@@ -440,6 +452,158 @@ export class ApiKeyDetector {
       parent = parent.parent;
     }
     return false;
+  }
+
+  private shouldIgnoreStringLiteral(node: ts.StringLiteral, text: string): boolean {
+    return (
+      this.isDetectorLogicString(text) ||
+      isStringLiteralInMetadataContext(node) ||
+      isEnumLikeLiteral(text) ||
+      isPathLikeLiteral(text)
+    );
+  }
+
+  private isLikelyGenericCredential(node: ts.StringLiteral, text: string): boolean {
+    if (!this.isInAssignmentContext(node)) {
+      return false;
+    }
+
+    const contextName = this.getCredentialContextName(node);
+    if (!contextName || !this.GENERIC_CREDENTIAL_NAME_PATTERN.test(contextName)) {
+      return false;
+    }
+
+    return this.looksLikeSecretValue(text);
+  }
+
+  private matchesCredentialText(
+    text: string,
+    serviceName: string,
+    pattern: RegExp
+  ): boolean {
+    if (!serviceName.startsWith('generic_')) {
+      return pattern.test(text);
+    }
+
+    return this.findInlineGenericCredential(text) !== null;
+  }
+
+  private getLoggedCredentialServiceName(arg: ts.Expression): string | null {
+    const argText = arg.getText();
+
+    for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
+      if (serviceName.startsWith('generic_')) {
+        continue;
+      }
+
+      if (pattern.test(argText)) {
+        return serviceName;
+      }
+    }
+
+    const identifierName = this.getSensitiveIdentifierName(arg);
+    if (identifierName && this.GENERIC_CREDENTIAL_NAME_PATTERN.test(identifierName)) {
+      return /api[_-]?key|apikey/i.test(identifierName) ? 'generic_api_key' : 'generic_secret';
+    }
+
+    const templateText = ts.isTemplateExpression(arg) ? arg.getText() : argText;
+    const inlineGeneric = this.findInlineGenericCredential(templateText);
+    if (inlineGeneric) {
+      return inlineGeneric.type;
+    }
+
+    return null;
+  }
+
+  private getSensitiveIdentifierName(expression: ts.Expression): string | null {
+    if (ts.isIdentifier(expression)) {
+      return expression.text;
+    }
+
+    if (ts.isPropertyAccessExpression(expression)) {
+      return expression.name.text;
+    }
+
+    if (
+      ts.isElementAccessExpression(expression) &&
+      ts.isStringLiteralLike(expression.argumentExpression)
+    ) {
+      return expression.argumentExpression.text;
+    }
+
+    if (ts.isTemplateExpression(expression)) {
+      for (const span of expression.templateSpans) {
+        const nestedName = this.getSensitiveIdentifierName(span.expression);
+        if (nestedName) {
+          return nestedName;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private getCredentialContextName(node: ts.Node): string | null {
+    let current: ts.Node | undefined = node;
+
+    while (current?.parent) {
+      const parent = current.parent;
+
+      if (ts.isVariableDeclaration(parent) && parent.initializer === current) {
+        return parent.name.getText(this.sourceFile);
+      }
+
+      if (ts.isPropertyAssignment(parent) && parent.initializer === current) {
+        return parent.name.getText(this.sourceFile);
+      }
+
+      if (ts.isParameter(parent) && parent.initializer === current) {
+        return parent.name.getText(this.sourceFile);
+      }
+
+      current = parent;
+    }
+
+    return null;
+  }
+
+  private looksLikeSecretValue(text: string): boolean {
+    if (text.length < 12 || /\s/.test(text) || /^[a-z]+(?:-[a-z]+)+$/.test(text)) {
+      return false;
+    }
+
+    if (/^[A-Fa-f0-9]{24,}$/.test(text)) {
+      return true;
+    }
+
+    const classes = [/[a-z]/, /[A-Z]/, /\d/, /[_./+=-]/].filter((pattern) => pattern.test(text)).length;
+    if (classes >= 3) {
+      return true;
+    }
+
+    return /[A-Za-z0-9._+=/-]{20,}/.test(text) && /\d/.test(text);
+  }
+
+  private findInlineGenericCredential(
+    text: string
+  ): { type: 'generic_api_key' | 'generic_secret'; value: string } | null {
+    const inlineMatch = /(?:api[_-]?key|apikey|secret|token|password|client[_-]?secret)\b[^:=\n]{0,20}[:=]\s*['"`]?([A-Za-z0-9._+=/-]{12,})/i.exec(
+      text
+    );
+
+    if (!inlineMatch) {
+      return null;
+    }
+
+    const value = inlineMatch[1];
+    if (!this.looksLikeSecretValue(value)) {
+      return null;
+    }
+
+    return {
+      type: /api[_-]?key|apikey/i.test(inlineMatch[0]) ? 'generic_api_key' : 'generic_secret',
+      value,
+    };
   }
 
   /**

@@ -122,7 +122,7 @@ describe('Validation Detector POC Generation', () => {
     });
 
     it('should retrieve generated POCs', () => {
-      const result = detector.detect();
+      detector.detect();
       const pocs = detector.getGeneratedPocs();
       
       expect(Array.isArray(pocs)).toBe(true);

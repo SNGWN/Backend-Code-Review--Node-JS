@@ -4,7 +4,6 @@ import { BackendCodeReviewAnalyzer } from '../src/analyzer';
 import { AuthenticationDetector } from '../src/detectors/authDetector';
 import { LogReviewDetector } from '../src/detectors/logDetector';
 import { MassAssignmentDetector } from '../src/detectors/massAssignDetector';
-import { RateLimitDetector } from '../src/detectors/rateLimitDetector';
 import { ParameterValidationDetector } from '../src/detectors/validationDetector';
 import { ASTParser } from '../src/parser/astParser';
 

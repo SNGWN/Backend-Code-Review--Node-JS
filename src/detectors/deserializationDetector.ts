@@ -2,7 +2,7 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
+import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
 import { hasValidationBoundary, isUntrustedInputText } from '../utils/detectorLogic';
 
@@ -239,8 +239,6 @@ export class DeserializationDetector {
     objectAssignCalls.forEach((node) => {
       const callExpr = node as ts.CallExpression;
       if (callExpr.arguments.length >= 2) {
-        const targetArg = callExpr.arguments[0].getText();
-        
         // Check if any source argument is untrusted
         for (let i = 1; i < callExpr.arguments.length; i++) {
           const sourceArg = callExpr.arguments[i].getText();
@@ -397,27 +395,8 @@ export class DeserializationDetector {
    * @param vulnerabilityType - The type of vulnerability
    * @private
    */
-  private generateDeserializationPoc(finding: Finding, vulnerabilityType: string): void {
+  private generateDeserializationPoc(finding: Finding, _vulnerabilityType: string): void {
     try {
-      const request: PocGenerationRequest = {
-        finding,
-        vulnerableCode: finding.code,
-        location: {
-          file: finding.file,
-          line: finding.line,
-          column: finding.column,
-        },
-        config: {
-          includeCodeSnippets: true,
-          includePayloads: true,
-          includeCodeFlow: true,
-          includeRemediation: true,
-          verbosity: 'normal',
-          format: 'markdown',
-          generateDiagrams: true,
-        },
-      };
-
       // const result = this.pocGenerator.generate(request, vulnerabilityType);
       //
       // if (result.success && result.poc) {

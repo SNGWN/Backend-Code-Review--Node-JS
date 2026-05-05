@@ -1,8 +1,7 @@
 import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
-import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { ProofOfConcept, PocGenerationRequest } from '../poc/types';
+import { ProofOfConcept } from '../poc/types';
 import {
   getRouteHandlerContexts,
   hasRateLimitProtection,
@@ -42,25 +41,6 @@ export class RateLimitDetector {
     '/api/keys',
     '/api/secrets',
     '/api/export',
-  ];
-
-  private rateLimitPatterns = [
-    'rateLimit',
-    'rateLimiter',
-    'RateLimit',
-    'rate-limit',
-    'express-rate-limit',
-    'express-limiter',
-    'throttle',
-    'request-ip',
-  ];
-
-  private bypassHeaders = [
-    'X-Forwarded-For',
-    'X-Real-IP',
-    'X-Client-IP',
-    'CF-Connecting-IP',
-    'X-Original-IP',
   ];
 
   constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
@@ -143,64 +123,6 @@ export class RateLimitDetector {
         }
       }
     });
-  }
-
-  /**
-   * Detect global-only rate limits without per-user limits
-   */
-  private detectGlobalOnlyRateLimits(): void {
-    let foundGlobalLimiter = false;
-    let foundPerUserLimiter = false;
-
-    ASTVisitor.visit(this.sourceFile, (node: ts.Node) => {
-      if (ts.isVariableDeclaration(node)) {
-        const name = node.name?.getText(this.sourceFile) || '';
-        const initializer = node.initializer?.getText(this.sourceFile) || '';
-
-        if (initializer.includes('rateLimit') || initializer.includes('rateLimiter')) {
-          // Check if it has keyGenerator for per-user limiting
-          if (
-            !initializer.includes('keyGenerator') &&
-            !initializer.includes('skip')
-          ) {
-            foundGlobalLimiter = true;
-          } else if (initializer.includes('keyGenerator')) {
-            foundPerUserLimiter = true;
-          }
-        }
-      }
-
-      // Look for rate limit configuration objects
-      if (ts.isObjectLiteralExpression(node)) {
-        const text = node.getText(this.sourceFile);
-
-        if (text.includes('windowMs') && text.includes('max')) {
-          if (!text.includes('keyGenerator')) {
-            foundGlobalLimiter = true;
-          } else {
-            foundPerUserLimiter = true;
-          }
-        }
-      }
-    });
-
-    if (foundGlobalLimiter && !foundPerUserLimiter) {
-      this.findings.push({
-        category: 'RATE_LIMITING',
-        severity: 'MEDIUM',
-        title: 'Global-Only Rate Limiting Without Per-User Limits',
-        description:
-          'The application uses global rate limiting without per-user limits. This allows an attacker to distribute requests across multiple user accounts to bypass rate limiting.',
-        file: this.filePath,
-        line: 1,
-        column: 1,
-        code: 'rateLimit({ windowMs: 60000, max: 100 })',
-        recommendation:
-          'Implement per-user rate limiting using keyGenerator: rateLimit({ windowMs: 60000, max: 5, keyGenerator: (req) => req.user?.id || req.ip })',
-      });
-
-      // this.generateGlobalOnlyBypassPoc(1);
-    }
   }
 
   /**
@@ -294,14 +216,14 @@ export class RateLimitDetector {
   /**
    * Generate POC for missing rate limiting
    */
-  private generateMissingRateLimitPoc(endpoint: string, line: number): void {
+  private generateMissingRateLimitPoc(_endpoint: string, _line: number): void {
     // POC generation coming in Phase 2 POC templates
   }
 
   /**
    * Generate POC for header bypass
    */
-  private generateHeaderBypassPoc(line: number): void {
+  private generateHeaderBypassPoc(_line: number): void {
     // POC generation coming in Phase 2 POC templates
   }
 }

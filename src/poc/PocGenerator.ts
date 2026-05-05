@@ -170,7 +170,7 @@ export abstract class PocGenerator {
   /**
    * Generate ASCII diagram from components and connections
    */
-  protected generateBasicDiagram(components: FlowComponent[], connections: FlowConnection[]): string {
+  protected generateBasicDiagram(components: FlowComponent[], _connections: FlowConnection[]): string {
     const lines: string[] = [];
 
     // Find input -> processing -> vulnerable -> output chain

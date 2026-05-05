@@ -1,5 +1,4 @@
 import { BackendCodeReviewAnalyzer } from '../src/analyzer';
-import * as fs from 'fs';
 import * as path from 'path';
 
 describe('AccessControlDetector', () => {

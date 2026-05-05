@@ -129,7 +129,7 @@ export class ASTParserBuilder {
     }
 
     const program = ts.createProgram(this.files, this.compilerOptions);
-    for (const [file, parser] of parsers) {
+    for (const [, parser] of parsers) {
       parser.setProgram(program);
     }
 

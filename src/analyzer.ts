@@ -7,8 +7,6 @@ import {
   Finding,
   IssueCategory,
   RuntimeIssue,
-  RuntimeIssueType,
-  Severity,
 } from './types';
 import { ASTParser } from './parser/astParser';
 import { AuthenticationDetector } from './detectors/authDetector';
@@ -29,6 +27,7 @@ import { EventStreamDetector } from './detectors/eventStreamDetector';
 import { FileHelper } from './utils/helpers';
 import { ProofOfConcept } from './poc/types';
 import { PocMarkdownReportGenerator } from './poc/PocMarkdownReportGenerator';
+import { JSONReporter } from './reporter';
 import { Logger } from './utils/logger';
 
 interface DetectorWithPocs {
@@ -149,7 +148,7 @@ export class BackendCodeReviewAnalyzer {
         severity: 'ERROR',
         message: errorMessage,
       });
-      Logger.error('Fatal error during analysis', { error: errorMessage });
+      Logger.runtimeError('Fatal error during analysis', { error: errorMessage });
       return this.generateReport();
     }
   }
@@ -189,7 +188,7 @@ export class BackendCodeReviewAnalyzer {
           message: `Failed to export POC ${poc.id}: ${errorMessage}`,
           outputPath: outputDir,
         });
-        Logger.error(`Failed to export POC ${poc.id}`, { error: errorMessage });
+        Logger.runtimeError(`Failed to export POC ${poc.id}`, { error: errorMessage });
       }
     });
 
@@ -235,7 +234,10 @@ export class BackendCodeReviewAnalyzer {
     }
 
     if (FileHelper.isDirectory(targetPath)) {
-      return FileHelper.getAllTypeScriptFiles(targetPath);
+      return FileHelper.getAllTypeScriptFiles(targetPath, {
+        respectGitIgnore: true,
+        ignorePatterns: this.getDirectoryIgnorePatterns(targetPath),
+      });
     }
 
     this.addRuntimeIssue({
@@ -244,7 +246,7 @@ export class BackendCodeReviewAnalyzer {
       message: `Path not found: ${targetPath}`,
       file: targetPath,
     });
-    Logger.error(`Path not found: ${targetPath}`);
+    Logger.runtimeError(`Path not found: ${targetPath}`);
     return [];
   }
 
@@ -261,7 +263,7 @@ export class BackendCodeReviewAnalyzer {
         message: parser.getLastError() || 'Failed to parse file',
         file: filePath,
       });
-      Logger.warn(`Skipping ${filePath} - failed to parse`, {
+      Logger.runtimeWarn(`Skipping ${filePath} - failed to parse`, {
         error: parser.getLastError() || 'syntax error',
       });
       return;
@@ -285,7 +287,7 @@ export class BackendCodeReviewAnalyzer {
           file: filePath,
           detector: detectorFactory.name,
         });
-        Logger.warn(`Detector ${detectorFactory.name} failed in ${filePath}`, {
+        Logger.runtimeWarn(`Detector ${detectorFactory.name} failed in ${filePath}`, {
           error: errorMessage,
         });
       }
@@ -306,62 +308,7 @@ export class BackendCodeReviewAnalyzer {
 
   private generateReport(): AnalysisReport {
     const reportFindings = this.getReportFindings();
-    const findingsByCategory: Record<IssueCategory, number> = {
-      AUTHENTICATION: 0,
-      VALIDATION: 0,
-      LOGGING: 0,
-      MASS_ASSIGNMENT: 0,
-      ACCESS_CONTROL: 0,
-      RATE_LIMITING: 0,
-      BUSINESS_LOGIC: 0,
-      API_KEY_EXPOSURE: 0,
-      CRYPTO_WEAKNESS: 0,
-      DATA_EXPOSURE: 0,
-      CACHE_POISONING: 0,
-      MESSAGE_QUEUE: 0,
-      EVENT_STREAM: 0,
-    };
-    const runtimeIssuesByType = this.createRuntimeIssueCountMap();
-
-    const findingsBySeverity: Record<Severity, number> = {
-      CRITICAL: 0,
-      HIGH: 0,
-      MEDIUM: 0,
-      LOW: 0,
-      INFO: 0,
-    };
-
-    reportFindings.forEach((finding) => {
-      findingsByCategory[finding.category]++;
-      findingsBySeverity[finding.severity]++;
-    });
-    this.runtimeIssues.forEach((issue) => {
-      runtimeIssuesByType[issue.type]++;
-    });
-
-    const severityOrder: Record<Severity, number> = {
-      CRITICAL: 0,
-      HIGH: 1,
-      MEDIUM: 2,
-      LOW: 3,
-      INFO: 4,
-    };
-
-    const sortedFindings = [...reportFindings].sort(
-      (a, b) => severityOrder[a.severity] - severityOrder[b.severity]
-    );
-
-    return {
-      timestamp: new Date().toISOString(),
-      filesAnalyzed: this.filesAnalyzed,
-      totalFindings: reportFindings.length,
-      findingsByCategory,
-      findingsBySeverity,
-      findings: sortedFindings,
-      runtimeIssues: [...this.runtimeIssues],
-      runtimeIssuesByType,
-      hasRuntimeErrors: this.runtimeIssues.some((issue) => issue.severity === 'ERROR'),
-    };
+    return JSONReporter.generateReport(reportFindings, this.filesAnalyzed, [...this.runtimeIssues]);
   }
 
   private isExploitableFinding(finding: Finding): boolean {
@@ -491,15 +438,13 @@ export class BackendCodeReviewAnalyzer {
     }));
   }
 
-  private createRuntimeIssueCountMap(): Record<RuntimeIssueType, number> {
-    return {
-      INVALID_TARGET: 0,
-      PARSE_FAILURE: 0,
-      DETECTOR_FAILURE: 0,
-      POC_EXPORT_FAILURE: 0,
-      REPORT_WRITE_FAILURE: 0,
-      FATAL_ANALYSIS_FAILURE: 0,
-    };
+  private getDirectoryIgnorePatterns(targetPath: string): string[] {
+    const excludedDirectories = ['dist', 'coverage', 'tests', '__tests__', 'pocs'];
+    const targetParts = path.resolve(targetPath).split(path.sep);
+
+    return excludedDirectories
+      .filter((directoryName) => !targetParts.includes(directoryName))
+      .map((directoryName) => `**/${directoryName}/**`);
   }
 
   private addRuntimeIssue(issue: RuntimeIssue): void {

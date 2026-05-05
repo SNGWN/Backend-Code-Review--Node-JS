@@ -1,4 +1,4 @@
-import { ProofOfConcept, ExploitationStep, Payload } from '../types';
+import { ExploitationStep, Payload } from '../types';
 import { PocGenerator } from '../PocGenerator';
 import { CodeFlowVisualizer } from '../CodeFlowVisualizer';
 import { PocGenerationRequest, PocGenerationResult } from '../types';
@@ -30,7 +30,7 @@ export class MassAssignmentPocGenerator extends PocGenerator {
       poc.steps = this.buildExploitationSteps(request, assignmentType);
 
       // Build code flow
-      poc.codeFlow = this.buildCodeFlow(request, assignmentType);
+      poc.codeFlow = this.buildCodeFlow(request);
 
       // Description
       poc.description = this.buildDescription(assignmentType);
@@ -170,7 +170,7 @@ Never use Object.assign() or spread operators directly on user input. Validate a
   /**
    * Build code flow for mass assignment attack
    */
-  private buildCodeFlow(request: PocGenerationRequest, assignmentType: string) {
+  private buildCodeFlow(request: PocGenerationRequest) {
     return CodeFlowVisualizer.generateFlowWithVariableTracking(
       request.vulnerableCode,
       request.location.file,

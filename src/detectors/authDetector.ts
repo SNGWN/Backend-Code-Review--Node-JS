@@ -3,7 +3,6 @@ import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { StringHelper } from '../utils/helpers';
-import { HTTP_METHODS, AUTH_VERIFICATION_FUNCTIONS, DETECTOR_LOGIC_STRINGS } from '../utils/constants';
 import { HardcodedSecretPocGenerator } from '../poc/templates/HardcodedSecretPocGenerator';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
@@ -11,7 +10,10 @@ import { Logger } from '../utils/logger';
 import {
   getRouteHandlerContexts,
   hasAuthenticationProtection,
+  isEnumLikeLiteral,
+  isPathLikeLiteral,
   isSensitiveRouteContext,
+  isStringLiteralInMetadataContext,
 } from '../utils/detectorLogic';
 
 /**
@@ -138,11 +140,17 @@ export class AuthenticationDetector {
     );
 
     stringLiterals.forEach((node) => {
-      const text = (node as ts.StringLiteral).text.toLowerCase();
+      const stringLiteral = node as ts.StringLiteral;
+      const rawText = stringLiteral.text;
+      const text = rawText.toLowerCase();
       const { line, column } = this.parser.getLineAndColumn(node.getStart());
 
-      // Skip detector's own logic strings (documentation, patterns, examples)
-      if (this.isDetectorDocString(text) || line >= 140 && line <= 175) {
+      if (
+        this.isDetectorDocString(text) ||
+        isStringLiteralInMetadataContext(stringLiteral) ||
+        isEnumLikeLiteral(rawText) ||
+        isPathLikeLiteral(rawText)
+      ) {
         return;
       }
 
@@ -185,16 +193,6 @@ export class AuthenticationDetector {
     ];
     
     return docStrings.some((doc) => text.includes(doc.toLowerCase()));
-  }
-
-  /** Check if string is part of this detector's logic (not real code to analyze) */
-  private isDetectionLogicString(text: string, line: number): boolean {
-    // Lines 131-145 are part of this detector's logic
-    // Don't flag our own detection code as vulnerable
-    if (line >= 131 && line <= 145) {
-      return true;
-    }
-    return false;
   }
 
   /** Check if a string literal is in an assignment context (indicates hardcoded secret) */
@@ -248,6 +246,14 @@ export class AuthenticationDetector {
 
       if (varName && StringHelper.containsSensitivePatterns(varName).length > 0) {
         if (decl.initializer && ts.isStringLiteral(decl.initializer)) {
+          if (
+            isStringLiteralInMetadataContext(decl.initializer) ||
+            isEnumLikeLiteral(decl.initializer.text) ||
+            isPathLikeLiteral(decl.initializer.text)
+          ) {
+            return;
+          }
+
           const { line, column } = this.parser.getLineAndColumn(decl.getStart());
           const code = decl.getText();
 

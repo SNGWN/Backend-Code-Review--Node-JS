@@ -1,8 +1,20 @@
 import * as path from 'path';
 import { BackendCodeReviewAnalyzer } from '../src/analyzer';
 import { AuthenticationDetector } from '../src/detectors/authDetector';
+import { Logger } from '../src/utils/logger';
 
 describe('Phase 3 Detectors & Analyzer Regression', () => {
+  const defaultTestLoggerConfig = {
+    quiet: true,
+    verbose: false,
+    format: 'text' as const,
+    suppressRuntimeIssueLogs: true,
+  };
+  const scopeFixturePath = (...segments: string[]) =>
+    path.join(__dirname, '..', 'scan-scope-fixtures', 'project-root', ...segments);
+  const scopeDisplayPath = (...segments: string[]) =>
+    path.join('scan-scope-fixtures', 'project-root', ...segments).split(path.sep).join('/');
+
   describe('Phase 3 category mapping', () => {
     test('detects cache poisoning findings under CACHE_POISONING', () => {
       const analyzer = new BackendCodeReviewAnalyzer();
@@ -90,14 +102,41 @@ describe('Phase 3 Detectors & Analyzer Regression', () => {
   });
 
   describe('Runtime issue reporting', () => {
-    test('reports invalid target paths as runtime errors', () => {
-      const analyzer = new BackendCodeReviewAnalyzer();
-      const report = analyzer.analyze(path.join(__dirname, 'fixtures', 'missing-target.ts'));
+    test('reports invalid target paths as runtime errors without noisy console output in tests', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 
-      expect(report.totalFindings).toBe(0);
-      expect(report.hasRuntimeErrors).toBe(true);
-      expect(report.runtimeIssuesByType.INVALID_TARGET).toBe(1);
-      expect(report.runtimeIssues[0]?.type).toBe('INVALID_TARGET');
+      try {
+        const analyzer = new BackendCodeReviewAnalyzer();
+        const report = analyzer.analyze(path.join(__dirname, 'fixtures', 'missing-target.ts'));
+
+        expect(report.totalFindings).toBe(0);
+        expect(report.hasRuntimeErrors).toBe(true);
+        expect(report.runtimeIssuesByType.INVALID_TARGET).toBe(1);
+        expect(report.runtimeIssues[0]?.type).toBe('INVALID_TARGET');
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('still emits runtime issue logs when suppression is disabled', () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      Logger.configure({
+        quiet: false,
+        verbose: false,
+        format: 'text',
+        suppressRuntimeIssueLogs: false,
+      });
+
+      try {
+        const analyzer = new BackendCodeReviewAnalyzer();
+        analyzer.analyze(path.join(__dirname, 'fixtures', 'missing-target.ts'));
+
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Path not found:'));
+      } finally {
+        Logger.configure(defaultTestLoggerConfig);
+        errorSpy.mockRestore();
+      }
     });
 
     test('reports parse failures as runtime errors', () => {
@@ -130,6 +169,41 @@ describe('Phase 3 Detectors & Analyzer Regression', () => {
       } finally {
         spy.mockRestore();
       }
+    });
+  });
+
+  describe('Scan scope handling', () => {
+    test('broad scans skip generated, ignored, and declaration-only targets', () => {
+      const analyzer = new BackendCodeReviewAnalyzer();
+      const report = analyzer.analyze(scopeFixturePath());
+
+      expect(report.filesAnalyzed).toBe(1);
+      expect(report.totalFindings).toBeGreaterThan(0);
+      expect([...new Set(report.findings.map((finding) => finding.file))]).toEqual([
+        scopeDisplayPath('included.ts'),
+      ]);
+    });
+
+    test('explicit file targets are still analyzable even when gitignored', () => {
+      const analyzer = new BackendCodeReviewAnalyzer();
+      const report = analyzer.analyze(scopeFixturePath('ignored-by-gitignore.ts'));
+
+      expect(report.filesAnalyzed).toBe(1);
+      expect(report.totalFindings).toBeGreaterThan(0);
+      expect([...new Set(report.findings.map((finding) => finding.file))]).toEqual([
+        scopeDisplayPath('ignored-by-gitignore.ts'),
+      ]);
+    });
+
+    test('explicit directory targets are still analyzable even when broad scans skip them', () => {
+      const analyzer = new BackendCodeReviewAnalyzer();
+      const report = analyzer.analyze(scopeFixturePath('tests'));
+
+      expect(report.filesAnalyzed).toBe(1);
+      expect(report.totalFindings).toBeGreaterThan(0);
+      expect([...new Set(report.findings.map((finding) => finding.file))]).toEqual([
+        scopeDisplayPath('tests', 'explicit-tests.ts'),
+      ]);
     });
   });
 });

@@ -1,4 +1,4 @@
-import { ProofOfConcept, ExploitationStep, Payload } from '../types';
+import { ExploitationStep, Payload } from '../types';
 import { PocGenerator } from '../PocGenerator';
 import { CodeFlowVisualizer } from '../CodeFlowVisualizer';
 import { PocGenerationRequest, PocGenerationResult } from '../types';
@@ -37,7 +37,7 @@ export class HardcodedSecretPocGenerator extends PocGenerator {
       );
 
       // Set description
-      poc.description = this.buildDescription(secretType, request.vulnerableCode);
+      poc.description = this.buildDescription(secretType);
 
       // Set root cause
       poc.rootCause = `The ${secretType} is hardcoded directly in the source code at ${request.location.file}:${request.location.line}. 
@@ -48,11 +48,11 @@ Anyone with access to the source code repository can extract and misuse this cre
       poc.technicalImpact = this.getTechnicalImpact(secretType);
 
       // Build payloads
-      poc.payloads = this.buildPayloads(secretType, request.vulnerableCode);
+      poc.payloads = this.buildPayloads(request.vulnerableCode);
 
       // Remediation
       poc.remediationDescription = `Move the ${secretType} to an environment variable or secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.). Never commit secrets to version control.`;
-      poc.remediationCode = this.getRemediationCode(secretType);
+      poc.remediationCode = this.getRemediationCode();
 
       // Add preconditions
       poc.preconditions = [
@@ -188,7 +188,7 @@ decompiled JAR/APK file, docker image analysis, or source code disclosure`,
   /**
    * Build payloads for attacking
    */
-  private buildPayloads(secretType: string, code: string): Payload[] {
+  private buildPayloads(code: string): Payload[] {
     const payloads: Payload[] = [];
 
     // Extract the actual credential from the code (first quoted string)
@@ -285,7 +285,7 @@ AWS.config.credentials = new AWS.Credentials(apiKey, apiKey);`,
   /**
    * Build description
    */
-  private buildDescription(secretType: string, code: string): string {
+  private buildDescription(secretType: string): string {
     return `A ${secretType} has been discovered hardcoded directly in the application source code. 
 This credential is stored in plaintext and accessible to anyone who can view the source code or decompile the application. 
 
@@ -351,7 +351,7 @@ Hardcoded credentials are a critical security vulnerability because:
   /**
    * Get remediation code
    */
-  private getRemediationCode(secretType: string): string {
+  private getRemediationCode(): string {
     return `// ❌ VULNERABLE: Hardcoded credential
 const API_KEY = 'sk-xxxxxxxxxxxxxxxxxxx';
 const DB_PASSWORD = 'admin123password';

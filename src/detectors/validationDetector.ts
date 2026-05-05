@@ -176,7 +176,6 @@ export class ParameterValidationDetector {
     severity: 'CRITICAL' | 'HIGH';
   } | null {
     const callName = ASTVisitor.getCallExpressionName(callExpr) || callExpr.expression.getText();
-    const callText = callExpr.getText();
     const hasInterpolatedQueryArg = callExpr.arguments.some(
       (arg) =>
         ts.isTemplateExpression(arg) ||

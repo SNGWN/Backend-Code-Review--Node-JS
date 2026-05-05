@@ -40,6 +40,61 @@ const UNTRUSTED_INPUT_PATTERN =
   /(req|request)\.(body|query|params|headers|cookies)|ctx\.request|userinput|userdata|payload|socket\.on\(|window\.|document\./i;
 const VALIDATION_BOUNDARY_PATTERN =
   /(joi|yup|zod|validator|express-validator|safeparse|schema|allowlist|whitelist|sanitize|pick\(|omit\(|stripunknown|strict\()/i;
+const FINDING_METADATA_FIELDS = new Set([
+  'category',
+  'title',
+  'description',
+  'recommendation',
+  'code',
+  'message',
+  'error',
+  'owaspCategory',
+  'vulnerabilityType',
+  'injectionType',
+]);
+
+function getPropertyNameText(name: ts.PropertyName): string | null {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) {
+    return name.text;
+  }
+
+  return null;
+}
+
+export function isStringLiteralInMetadataContext(node: ts.StringLiteralLike): boolean {
+  if (ts.isImportDeclaration(node.parent) || ts.isExportDeclaration(node.parent)) {
+    return true;
+  }
+
+  let current: ts.Node | undefined = node.parent;
+  while (current) {
+    if (ts.isPropertyAssignment(current)) {
+      const propertyName = getPropertyNameText(current.name);
+      return propertyName ? FINDING_METADATA_FIELDS.has(propertyName) : false;
+    }
+
+    if (
+      ts.isObjectLiteralExpression(current) ||
+      ts.isArrayLiteralExpression(current) ||
+      ts.isVariableDeclaration(current)
+    ) {
+      current = current.parent;
+      continue;
+    }
+
+    break;
+  }
+
+  return false;
+}
+
+export function isEnumLikeLiteral(text: string): boolean {
+  return /^[A-Z][A-Z0-9_]+$/.test(text);
+}
+
+export function isPathLikeLiteral(text: string): boolean {
+  return text.includes('/') || text.includes('\\') || text.startsWith('.');
+}
 
 export function getRouteHandlerContexts(
   sourceFile: ts.SourceFile,

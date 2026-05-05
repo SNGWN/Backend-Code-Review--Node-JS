@@ -1,4 +1,4 @@
-import { ProofOfConcept, ExploitationStep, Payload } from '../types';
+import { ExploitationStep, Payload } from '../types';
 import { PocGenerator } from '../PocGenerator';
 import { CodeFlowVisualizer } from '../CodeFlowVisualizer';
 import { PocGenerationRequest, PocGenerationResult } from '../types';

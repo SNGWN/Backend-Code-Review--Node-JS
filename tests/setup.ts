@@ -4,4 +4,5 @@ Logger.configure({
   quiet: true,
   verbose: false,
   format: 'text',
+  suppressRuntimeIssueLogs: true,
 });

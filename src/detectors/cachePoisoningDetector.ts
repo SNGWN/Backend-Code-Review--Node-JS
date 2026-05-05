@@ -2,7 +2,6 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { ProofOfConcept } from '../poc/types';
 
 /**
  * Cache Poisoning Detector (Phase 3)
@@ -17,12 +16,10 @@ export class CachePoisoningDetector {
   private findings: Finding[] = [];
   private filePath: string;
   private sourceFile: ts.SourceFile;
-  private parser: ASTParser;
 
-  constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
+  constructor(filePath: string, sourceFile: ts.SourceFile, _parser: ASTParser) {
     this.filePath = filePath;
     this.sourceFile = sourceFile;
-    this.parser = parser;
   }
 
   detect(): DetectorResult {

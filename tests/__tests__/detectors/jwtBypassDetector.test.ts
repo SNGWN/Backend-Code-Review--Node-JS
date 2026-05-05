@@ -89,20 +89,20 @@ describe('JwtBypassDetector', () => {
 
   describe('POC Generation', () => {
     it('should generate POCs for findings', () => {
-      const result = detector.detect();
+      detector.detect();
       const pocs = detector.getPocs();
       expect(pocs.length).toBeGreaterThan(0);
     });
 
     it('should include exploitation steps in POCs', () => {
-      const result = detector.detect();
+      detector.detect();
       const pocs = detector.getPocs();
       const pocsWithSteps = pocs.filter(poc => poc.steps && poc.steps.length > 0);
       expect(pocsWithSteps.length).toBeGreaterThan(0);
     });
 
     it('should include remediation code in POCs', () => {
-      const result = detector.detect();
+      detector.detect();
       const pocs = detector.getPocs();
       const pocsWithRemediation = pocs.filter(poc => poc.remediationCode && poc.remediationCode.length > 0);
       expect(pocsWithRemediation.length).toBeGreaterThan(0);

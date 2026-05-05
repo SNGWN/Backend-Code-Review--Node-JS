@@ -5,6 +5,7 @@ interface LoggerConfig {
   quiet: boolean;
   verbose: boolean;
   format: LogFormat;
+  suppressRuntimeIssueLogs: boolean;
 }
 
 interface LogMeta {
@@ -16,6 +17,7 @@ export class Logger {
     quiet: false,
     verbose: false,
     format: 'text',
+    suppressRuntimeIssueLogs: false,
   };
 
   static configure(config: Partial<LoggerConfig>): void {
@@ -62,6 +64,22 @@ export class Logger {
   }
 
   static error(message: string, meta?: LogMeta): void {
+    this.emit('error', message, meta);
+  }
+
+  static runtimeWarn(message: string, meta?: LogMeta): void {
+    if (this.config.suppressRuntimeIssueLogs || this.config.quiet) {
+      return;
+    }
+
+    this.emit('warn', message, meta);
+  }
+
+  static runtimeError(message: string, meta?: LogMeta): void {
+    if (this.config.suppressRuntimeIssueLogs) {
+      return;
+    }
+
     this.emit('error', message, meta);
   }
 

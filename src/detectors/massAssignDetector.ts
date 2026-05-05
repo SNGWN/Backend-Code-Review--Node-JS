@@ -209,7 +209,7 @@ export class MassAssignmentDetector {
       const objLiteral = node as ts.ObjectLiteralExpression;
       const propMap = ASTVisitor.getObjectProperties(objLiteral);
 
-      propMap.forEach((value, key) => {
+      propMap.forEach((_value, key) => {
         if (
           key === 'constructor' ||
           key === '__proto__' ||

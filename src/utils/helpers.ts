@@ -1,11 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import {
-  SENSITIVE_DATA_PATTERNS,
-  VALIDATION_LIBRARIES,
-  SENSITIVE_LOG_KEYWORDS,
-} from './constants';
+import fg from 'fast-glob';
+import ignore from 'ignore';
+import { VALIDATION_LIBRARIES } from './constants';
 import { Logger } from './logger';
+
+interface FileDiscoveryOptions {
+  ignorePatterns?: string[];
+  respectGitIgnore?: boolean;
+}
 
 /**
  * File system utility class for reading and discovering TypeScript files
@@ -13,7 +16,7 @@ import { Logger } from './logger';
 export class FileHelper {
   /**
    * Recursively finds all TypeScript (.ts, .tsx) files in a directory
-   * Automatically skips node_modules and hidden directories
+   * Automatically skips ignored/generated directories and declaration files
    *
    * @param dirPath - Root directory path to search
    * @returns Array of absolute file paths for all TypeScript files found
@@ -22,33 +25,28 @@ export class FileHelper {
    * const files = FileHelper.getAllTypeScriptFiles('./src');
    * // Returns: ['/path/to/src/app.ts', '/path/to/src/routes.ts', ...]
    */
-  static getAllTypeScriptFiles(dirPath: string): string[] {
-    const files: string[] = [];
+  static getAllTypeScriptFiles(dirPath: string, options: FileDiscoveryOptions = {}): string[] {
+    const searchRoot = path.resolve(dirPath);
+    const ignoreMatcher = options.respectGitIgnore ? this.loadGitIgnoreMatcher(searchRoot) : null;
 
-    const walk = (dir: string) => {
-      try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
+    try {
+      const files = fg.sync(['**/*.ts', '**/*.tsx'], {
+        cwd: searchRoot,
+        absolute: true,
+        onlyFiles: true,
+        unique: true,
+        dot: false,
+        ignore: ['**/*.d.ts', '**/node_modules/**', ...(options.ignorePatterns ?? [])],
+      });
 
-        for (const entry of entries) {
-          if (entry.name.startsWith('.')) continue;
-          if (entry.name === 'node_modules') continue;
-
-          const fullPath = path.join(dir, entry.name);
-
-          if (entry.isDirectory()) {
-            walk(fullPath);
-          } else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx'))) {
-            files.push(fullPath);
-          }
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        Logger.error(`Error reading directory ${dir}`, { error: errorMessage });
-      }
-    };
-
-    walk(dirPath);
-    return files;
+      return files
+        .filter((filePath) => !this.isIgnoredByMatcher(filePath, searchRoot, ignoreMatcher))
+        .sort();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      Logger.error(`Error reading directory ${dirPath}`, { error: errorMessage });
+      return [];
+    }
   }
 
   /**
@@ -96,6 +94,41 @@ export class FileHelper {
     } catch {
       return false;
     }
+  }
+
+  private static loadGitIgnoreMatcher(searchRoot: string) {
+    const gitignorePaths = [path.join(process.cwd(), '.gitignore')];
+    if (searchRoot !== process.cwd()) {
+      gitignorePaths.push(path.join(searchRoot, '.gitignore'));
+    }
+
+    const patterns = gitignorePaths
+      .filter((gitignorePath, index, allPaths) => allPaths.indexOf(gitignorePath) === index && fs.existsSync(gitignorePath))
+      .map((gitignorePath) => fs.readFileSync(gitignorePath, 'utf-8'));
+
+    if (patterns.length === 0) {
+      return null;
+    }
+
+    return ignore().add(patterns.join('\n'));
+  }
+
+  private static isIgnoredByMatcher(
+    filePath: string,
+    searchRoot: string,
+    ignoreMatcher: ReturnType<typeof ignore> | null
+  ): boolean {
+    if (!ignoreMatcher) {
+      return false;
+    }
+
+    const cwdRelativePath = path.relative(process.cwd(), filePath);
+    const rootRelativePath = path.relative(searchRoot, filePath);
+    const candidatePath = !cwdRelativePath.startsWith('..')
+      ? cwdRelativePath
+      : rootRelativePath;
+
+    return ignoreMatcher.ignores(candidatePath.split(path.sep).join('/'));
   }
 }
 

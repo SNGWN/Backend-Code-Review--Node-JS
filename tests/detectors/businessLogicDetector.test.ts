@@ -7,6 +7,7 @@ import {
   insufficientFundsCode,
   clientSidePriceCode,
   inventoryOverSellingCode,
+  fixedInventoryCode,
 } from '../fixtures/businessLogicFixtures';
 
 describe('BusinessLogicDetector', () => {
@@ -110,6 +111,46 @@ describe('BusinessLogicDetector', () => {
       const result = detector.detect();
 
       expect(result.findings.length).toBeGreaterThan(0);
+    });
+
+    it('should ignore atomic inventory updates with quantity guards', () => {
+      const sourceFile = ts.createSourceFile(
+        'inventory.ts',
+        fixedInventoryCode,
+        ts.ScriptTarget.Latest,
+        true
+      );
+
+      const detector = new BusinessLogicDetector('inventory.ts', sourceFile, parser);
+      const result = detector.detect();
+
+      expect(
+        result.findings.some((finding) =>
+          finding.title.toLowerCase().includes('inventory over-selling')
+        )
+      ).toBe(false);
+    });
+  });
+
+  describe('False Positive Regression', () => {
+    it('should ignore detector-style string matching logic with payment keywords', () => {
+      const sourceFile = ts.createSourceFile(
+        'detector.ts',
+        `
+        function shouldFlag(sourceText: string, nodeText: string) {
+          return (sourceText.includes('req.body') || sourceText.includes('req.query')) &&
+            (sourceText.includes('charge') || sourceText.includes('payment') || sourceText.includes('stripe')) &&
+            nodeText.includes('amount');
+        }
+        `,
+        ts.ScriptTarget.Latest,
+        true
+      );
+
+      const detector = new BusinessLogicDetector('detector.ts', sourceFile, parser);
+      const result = detector.detect();
+
+      expect(result.findings).toHaveLength(0);
     });
   });
 

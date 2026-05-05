@@ -3,7 +3,7 @@ import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
-import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
 import { getEnclosingScopeText } from '../utils/detectorLogic';
 
@@ -23,14 +23,12 @@ export class JwtBypassDetector {
   private findings: Finding[] = [];
   private filePath: string;
   private sourceFile: ts.SourceFile;
-  private parser: ASTParser;
   private generatedPocs: ProofOfConcept[] = [];
   private fileContent: string;
 
-  constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
+  constructor(filePath: string, sourceFile: ts.SourceFile, _parser: ASTParser) {
     this.filePath = filePath;
     this.sourceFile = sourceFile;
-    this.parser = parser;
     this.fileContent = sourceFile.getFullText();
   }
 

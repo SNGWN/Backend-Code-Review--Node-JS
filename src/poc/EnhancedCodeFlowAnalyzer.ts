@@ -1,4 +1,4 @@
-import { CodeFlow, ExploitationStep } from './types';
+import { ExploitationStep } from './types';
 
 /**
  * Enhanced Code Flow Analyzer
@@ -94,7 +94,7 @@ export class EnhancedCodeFlowAnalyzer {
     diagram.push(`${client.padEnd(20)} ${server.padEnd(20)}`);
     diagram.push(`   │                    │`);
 
-    steps.forEach((step, index) => {
+    steps.forEach((step) => {
       if (step.actor === 'attacker' || step.actor === 'frontend') {
         diagram.push(`   │────────────────────▶ ${step.description.substring(0, 20)}`);
       } else if (step.actor === 'backend' || step.actor === 'database') {
@@ -167,12 +167,9 @@ export class EnhancedCodeFlowAnalyzer {
    */
   static analyzeExploitDependencies(steps: ExploitationStep[]): string {
     const deps: string[] = ['\n# Exploit Dependency Graph\n'];
-    
-    const stepMap = new Map<number, ExploitationStep>();
-    steps.forEach(s => stepMap.set(s.stepNumber, s));
 
     deps.push('**Prerequisite Analysis**:\n');
-    
+
     steps.forEach((step, index) => {
       if (index === 0) {
         deps.push(`- Step ${step.stepNumber}: Initial payload (no prerequisites)`);
@@ -221,7 +218,7 @@ Thread 2: ──────────────── [Modify] ────
     const stages: string[] = [];
     let currentStage = 'Reconnaissance';
 
-    steps.forEach((step, index) => {
+    steps.forEach((step) => {
       if (step.stepNumber <= 2) {
         currentStage = 'Reconnaissance';
       } else if (step.stepNumber <= 4) {

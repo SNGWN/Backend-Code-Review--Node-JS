@@ -2,10 +2,14 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { StringHelper } from '../utils/helpers';
-import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
+import { ProofOfConcept } from '../poc/types';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { Logger } from '../utils/logger';
+import {
+  getRouteHandlerContexts,
+  isUserControlledExpression,
+  RouteHandlerContext,
+} from '../utils/detectorLogic';
 
 /**
  * Business Logic Flaw Detector
@@ -31,6 +35,7 @@ export class BusinessLogicDetector {
   private sourceFile: ts.SourceFile;
   private parser: ASTParser;
   private generatedPocs: ProofOfConcept[] = [];
+  private findingKeys = new Set<string>();
 
   constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
     this.filePath = filePath;
@@ -56,6 +61,7 @@ export class BusinessLogicDetector {
   detect(): DetectorResult {
     this.findings = [];
     this.generatedPocs = [];
+    this.findingKeys.clear();
 
     this.detectRaceConditions();
     this.detectMissingIdempotencyKeys();
@@ -102,8 +108,6 @@ export class BusinessLogicDetector {
     // Look for functions with multiple awaits without transaction/lock
     const asyncFunctionPattern = /async\s+function|async\s*\(|async\s*=>/;
     const multipleAwaitPattern = /await.*?;.*?await/s;
-    const noTransactionPattern = /(?!.*transaction|.*lock|.*mutex)/;
-    
     if (asyncFunctionPattern.test(sourceText) && multipleAwaitPattern.test(sourceText)) {
       // Find the function node
       const functions = ASTVisitor.findNodes(this.sourceFile, (node) => {
@@ -148,55 +152,33 @@ export class BusinessLogicDetector {
    * Looks for payment/charge operations without idempotency verification
    */
   private detectMissingIdempotencyKeys(): void {
-    const sourceText = this.sourceFile.getText();
-    
-    // Look for payment/charge operations
-    if (sourceText.includes('charge') || sourceText.includes('payment') || 
-        sourceText.includes('stripe')) {
-      
-      const nodes = ASTVisitor.findNodes(this.sourceFile, (node) => {
-        if (ts.isCallExpression(node)) {
-          const text = node.getText();
-          return text.includes('charge') || text.includes('payment') || 
-                 text.includes('stripe');
-        }
-        return false;
-      });
+    this.getPaymentRouteContexts().forEach((route) => {
+      if (!route.handler || this.hasIdempotencyProtection(route)) {
+        return;
+      }
 
-      nodes.forEach((node) => {
-        const nodeText = node.getText();
-        const parentText = node.parent?.getText() || '';
-        const fullContext = sourceText.substring(
-          Math.max(0, node.getStart() - 300), 
-          Math.min(sourceText.length, node.getEnd() + 300)
-        );
+      const paymentCall = this.findPaymentCalls(route.handler)[0];
+      if (!paymentCall) {
+        return;
+      }
 
-        // Check if there's idempotency key handling
-        const hasIdempotency = fullContext.includes('idempotency') || 
-                              fullContext.includes('idempotentKey') ||
-                              fullContext.includes('requestId') ||
-                              fullContext.includes('duplicate');
-
-        if (!hasIdempotency && (nodeText.includes('charge') || nodeText.includes('create'))) {
-          const { line, column } = this.parser.getLineAndColumn(node.getStart());
-          
-          const finding: Finding = {
-            category: 'BUSINESS_LOGIC',
-            severity: 'CRITICAL',
-            title: 'Missing Idempotency Key Validation',
-            description: 'Payment/charge operation lacks idempotency key verification. Network retries could cause duplicate charges.',
-            file: this.filePath,
-            line,
-            column,
-            code: nodeText.substring(0, 80),
-            recommendation: 'Implement idempotency key validation to prevent duplicate transactions. Store processed request IDs and check before processing.',
-          };
-          
-          this.findings.push(finding);
-          this.generateBusinessLogicPoc(finding, nodeText, line);
-        }
-      });
-    }
+      const { line, column } = this.parser.getLineAndColumn(paymentCall.getStart());
+      this.recordBusinessLogicFinding(
+        {
+          category: 'BUSINESS_LOGIC',
+          severity: 'CRITICAL',
+          title: 'Missing Idempotency Key Validation',
+          description: 'Payment/charge operation lacks idempotency key verification. Network retries could cause duplicate charges.',
+          file: this.filePath,
+          line,
+          column,
+          code: paymentCall.getText().substring(0, 80),
+          recommendation: 'Implement idempotency key validation to prevent duplicate transactions. Store processed request IDs and check before processing.',
+        },
+        paymentCall.getText(),
+        line
+      );
+    });
   }
 
   /**
@@ -252,84 +234,37 @@ export class BusinessLogicDetector {
    * Looks for price parameters from request body in financial operations
    */
   private detectClientSidePriceUsage(): void {
-    const sourceText = this.sourceFile.getText();
-    
-    // Look for req.body usage with price/amount in charge/payment operations
-    if ((sourceText.includes('req.body') || sourceText.includes('req.query')) &&
-        (sourceText.includes('charge') || sourceText.includes('payment') || 
-         sourceText.includes('stripe'))) {
-      
-      const nodes = ASTVisitor.findNodes(this.sourceFile, (node) => {
-        const text = node.getText();
-        return text.includes('req.body') || text.includes('req.query') || 
-               text.includes('params');
-      });
-
-      nodes.forEach((node) => {
-        const nodeText = node.getText();
-        const { line, column } = this.parser.getLineAndColumn(node.getStart());
-
-        // Check if this is price/amount from request
-        if ((nodeText.includes('price') || nodeText.includes('amount') || 
-             nodeText.includes('total')) &&
-            (nodeText.includes('req.body') || nodeText.includes('req.query'))) {
-          
-          // Check if used in payment context
-          const parentText = ASTVisitor.findNodes(this.sourceFile, (n) => {
-            const text = n.getText();
-            return text.includes('charge') || text.includes('payment');
-          });
-
-          if (parentText.length > 0) {
-            const finding: Finding = {
-              category: 'BUSINESS_LOGIC',
-              severity: 'CRITICAL',
-              title: 'Client-Controlled Price in Payment Operation',
-              description: 'Price/amount for payment is taken from user request without server-side validation. Attacker can modify the amount.',
-              file: this.filePath,
-              line,
-              column,
-              code: nodeText.substring(0, 80),
-              recommendation: 'Always retrieve price from server-side database. Never trust client-supplied price amounts. Validate against inventory pricing.',
-            };
-            
-            this.findings.push(finding);
-            this.generateBusinessLogicPoc(finding, nodeText, line);
-          }
-        }
-      });
-
-      // Alternative pattern: look for stripe.charges with user-controlled amount
-      if (sourceText.includes('stripe')) {
-        const chargeNodes = ASTVisitor.findNodes(this.sourceFile, (node) => {
-          const text = node.getText();
-          return text.includes('stripe.charges') || text.includes('charges.create');
-        });
-
-        chargeNodes.forEach((node) => {
-          const nodeText = node.getText();
-          const { line, column } = this.parser.getLineAndColumn(node.getStart());
-
-          if (nodeText.includes('amount') && 
-              (nodeText.includes('req.body') || nodeText.includes('params'))) {
-            const finding: Finding = {
-              category: 'BUSINESS_LOGIC',
-              severity: 'CRITICAL',
-              title: 'Client-Controlled Price in Payment Operation',
-              description: 'Amount parameter in payment comes from user input. Attacker can manipulate charge amount.',
-              file: this.filePath,
-              line,
-              column,
-              code: nodeText.substring(0, 80),
-              recommendation: 'Retrieve product price from server database, not from client request.',
-            };
-            
-            this.findings.push(finding);
-            this.generateBusinessLogicPoc(finding, nodeText, line);
-          }
-        });
+    this.getPaymentRouteContexts().forEach((route) => {
+      if (!route.handler) {
+        return;
       }
-    }
+
+      const taintedVariables = this.buildRequestDerivedVariableSet(route.handler);
+      const riskyAmount = this.findPaymentCalls(route.handler)
+        .flatMap((callExpr) => this.getPaymentAmountExpressions(callExpr))
+        .find((expression) => this.referencesRequestDerivedInput(expression, taintedVariables));
+
+      if (!riskyAmount) {
+        return;
+      }
+
+      const { line, column } = this.parser.getLineAndColumn(riskyAmount.getStart());
+      this.recordBusinessLogicFinding(
+        {
+          category: 'BUSINESS_LOGIC',
+          severity: 'CRITICAL',
+          title: 'Client-Controlled Price in Payment Operation',
+          description: 'Price/amount for payment is taken from user request without server-side validation. Attacker can modify the amount.',
+          file: this.filePath,
+          line,
+          column,
+          code: riskyAmount.getText().substring(0, 80),
+          recommendation: 'Always retrieve price from server-side database. Never trust client-supplied price amounts. Validate against inventory pricing.',
+        },
+        riskyAmount.getText(),
+        line
+      );
+    });
   }
 
   /**
@@ -337,49 +272,203 @@ export class BusinessLogicDetector {
    * Looks for concurrent inventory updates without proper synchronization
    */
   private detectInventoryOverSelling(): void {
-    const sourceText = this.sourceFile.getText();
-    
-    if (sourceText.includes('quantity') || sourceText.includes('stock') || 
-        sourceText.includes('inventory')) {
-      
-      const nodes = ASTVisitor.findNodes(this.sourceFile, (node) => {
-        const text = node.getText().toLowerCase();
-        return (text.includes('quantity') || text.includes('stock') || 
-                text.includes('inventory')) &&
-               (text.includes('update') || text.includes('decrement') || 
-                text.includes('-=') || text.includes('query'));
-      });
+    this.getFunctionLikeNodes().forEach((scope) => {
+      const scopeText = scope.getText().toLowerCase();
+      if (!/(quantity|stock|inventory)/.test(scopeText)) {
+        return;
+      }
 
-      nodes.forEach((node) => {
-        const nodeText = node.getText();
-        const { line, column } = this.parser.getLineAndColumn(node.getStart());
+      if (/(transaction|lock|for update|mutex|semaphore)/.test(scopeText)) {
+        return;
+      }
 
-        // Check for missing atomic verification
-        const hasVerification = nodeText.includes('check') || 
-                               nodeText.includes('verify') ||
-                               nodeText.includes('WHERE') ||
-                               nodeText.includes('AND quantity') ||
-                               nodeText.includes('>= quantity');
+      const dbCalls = ASTVisitor.findNodes(scope, (node) => ts.isCallExpression(node)) as ts.CallExpression[];
+      const inventoryRead = dbCalls.find((callExpr) => this.isInventoryReadCall(callExpr));
+      const inventoryWrite = dbCalls.find((callExpr) => this.isInventoryWriteCall(callExpr));
 
-        if (!hasVerification && 
-            (nodeText.includes('quantity') || nodeText.includes('stock'))) {
-          const finding: Finding = {
-            category: 'BUSINESS_LOGIC',
-            severity: 'HIGH',
-            title: 'Inventory Over-Selling in Concurrent Purchases',
-            description: 'Inventory is decremented without atomic verification. Multiple concurrent purchases could result in negative stock.',
-            file: this.filePath,
-            line,
-            column,
-            code: nodeText.substring(0, 80),
-            recommendation: 'Use atomic database operations or row-level locks to ensure quantity never goes negative. Implement: UPDATE inventory SET quantity = quantity - X WHERE product_id = Y AND quantity >= X',
-          };
-          
-          this.findings.push(finding);
-          this.generateBusinessLogicPoc(finding, nodeText, line);
-        }
-      });
+      if (!inventoryRead || !inventoryWrite || this.hasAtomicInventoryGuard(inventoryWrite.getText().toLowerCase())) {
+        return;
+      }
+
+      const { line, column } = this.parser.getLineAndColumn(inventoryWrite.getStart());
+      this.recordBusinessLogicFinding(
+        {
+          category: 'BUSINESS_LOGIC',
+          severity: 'HIGH',
+          title: 'Inventory Over-Selling in Concurrent Purchases',
+          description: 'Inventory is decremented without atomic verification. Multiple concurrent purchases could result in negative stock.',
+          file: this.filePath,
+          line,
+          column,
+          code: inventoryWrite.getText().substring(0, 80),
+          recommendation: 'Use atomic database operations or row-level locks to ensure quantity never goes negative. Implement: UPDATE inventory SET quantity = quantity - X WHERE product_id = Y AND quantity >= X',
+        },
+        scope.getText(),
+        line
+      );
+    });
+  }
+
+  private getPaymentRouteContexts(): RouteHandlerContext[] {
+    return getRouteHandlerContexts(this.sourceFile, this.parser).filter((route) => {
+      const contextText = `${route.path}\n${route.handlerText}`.toLowerCase();
+      return /(charge|payment|checkout|purchase|refund|billing|invoice|stripe|order)/.test(contextText);
+    });
+  }
+
+  private hasIdempotencyProtection(route: RouteHandlerContext): boolean {
+    const text = [route.routeText, route.middlewareText, route.handlerText].join('\n').toLowerCase();
+    return /(idempotency|idempotentkey|requestid|duplicate|dedupe|processed[_-]?request)/.test(text);
+  }
+
+  private findPaymentCalls(scope: ts.Node): ts.CallExpression[] {
+    return (ASTVisitor.findNodes(scope, (node) => ts.isCallExpression(node)) as ts.CallExpression[]).filter(
+      (callExpr) => this.isPaymentOperationCall(callExpr)
+    );
+  }
+
+  private isPaymentOperationCall(callExpr: ts.CallExpression): boolean {
+    const expressionText = callExpr.expression.getText(this.sourceFile).toLowerCase();
+    return (
+      /(stripe\.charges\.create|charges\.create|createcharge|paymentintent|payments?\.create|checkout)/.test(
+        expressionText
+      ) ||
+      (/(charge|payment)/.test(expressionText) && callExpr.arguments.length > 0)
+    );
+  }
+
+  private getPaymentAmountExpressions(callExpr: ts.CallExpression): ts.Expression[] {
+    const amountExpressions: ts.Expression[] = [];
+
+    callExpr.arguments.forEach((argument) => {
+      if (ts.isObjectLiteralExpression(argument)) {
+        argument.properties.forEach((property) => {
+          if (!ts.isPropertyAssignment(property)) {
+            return;
+          }
+
+          const propertyName = property.name.getText(this.sourceFile).replace(/['"`]/g, '').toLowerCase();
+          if (/(amount|price|total|unitamount|unit_amount)/.test(propertyName)) {
+            amountExpressions.push(property.initializer);
+          }
+        });
+        return;
+      }
+
+      if (/(amount|price|total)/.test(argument.getText(this.sourceFile).toLowerCase())) {
+        amountExpressions.push(argument);
+      }
+    });
+
+    return amountExpressions;
+  }
+
+  private buildRequestDerivedVariableSet(scope: ts.Node): Set<string> {
+    const tainted = new Set<string>();
+    const declarations = ASTVisitor.findNodes(scope, (node) => ts.isVariableDeclaration(node)) as ts.VariableDeclaration[];
+
+    declarations.forEach((declaration) => {
+      const initializer = declaration.initializer;
+      if (!initializer || !this.referencesRequestDerivedInput(initializer, tainted)) {
+        return;
+      }
+
+      if (ts.isIdentifier(declaration.name)) {
+        tainted.add(declaration.name.text);
+        return;
+      }
+
+      if (ts.isObjectBindingPattern(declaration.name) || ts.isArrayBindingPattern(declaration.name)) {
+        declaration.name.elements.forEach((element) => {
+          if (ts.isBindingElement(element) && ts.isIdentifier(element.name)) {
+            tainted.add(element.name.text);
+          }
+        });
+      }
+    });
+
+    return tainted;
+  }
+
+  private referencesRequestDerivedInput(expression: ts.Expression, taintedVariables: Set<string>): boolean {
+    if (isUserControlledExpression(expression, this.sourceFile)) {
+      return true;
     }
+
+    if (ts.isIdentifier(expression)) {
+      return taintedVariables.has(expression.text);
+    }
+
+    if (ts.isPropertyAccessExpression(expression)) {
+      return this.referencesRequestDerivedInput(expression.expression, taintedVariables);
+    }
+
+    if (ts.isElementAccessExpression(expression)) {
+      return this.referencesRequestDerivedInput(expression.expression, taintedVariables);
+    }
+
+    if (ts.isParenthesizedExpression(expression) || ts.isAsExpression(expression) || ts.isNonNullExpression(expression)) {
+      return this.referencesRequestDerivedInput(expression.expression, taintedVariables);
+    }
+
+    if (ts.isBinaryExpression(expression)) {
+      return (
+        this.referencesRequestDerivedInput(expression.left, taintedVariables) ||
+        this.referencesRequestDerivedInput(expression.right, taintedVariables)
+      );
+    }
+
+    if (ts.isTemplateExpression(expression)) {
+      return expression.templateSpans.some((span) =>
+        this.referencesRequestDerivedInput(span.expression, taintedVariables)
+      );
+    }
+
+    if (ts.isCallExpression(expression)) {
+      return expression.arguments.some((arg) => this.referencesRequestDerivedInput(arg, taintedVariables));
+    }
+
+    return false;
+  }
+
+  private getFunctionLikeNodes(): ts.Node[] {
+    return ASTVisitor.findNodes(
+      this.sourceFile,
+      (node) =>
+        ts.isFunctionDeclaration(node) ||
+        ts.isArrowFunction(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isMethodDeclaration(node)
+    );
+  }
+
+  private isInventoryReadCall(callExpr: ts.CallExpression): boolean {
+    const text = callExpr.getText(this.sourceFile).toLowerCase();
+    return /(select|find|findone|get|query)/.test(text) && /(quantity|stock|inventory)/.test(text);
+  }
+
+  private isInventoryWriteCall(callExpr: ts.CallExpression): boolean {
+    const text = callExpr.getText(this.sourceFile).toLowerCase();
+    return /(update|decrement|adjust|save|query)/.test(text) &&
+      /(quantity|stock|inventory)/.test(text) &&
+      /(-|decrement|set\s+quantity\s*=|set\s+stock\s*=)/.test(text);
+  }
+
+  private hasAtomicInventoryGuard(text: string): boolean {
+    return /(where[\s\S]*quantity\s*>=|where[\s\S]*stock\s*>=|and quantity|and stock|affectedrows|rowcount)/.test(
+      text
+    );
+  }
+
+  private recordBusinessLogicFinding(finding: Finding, vulnerableCode: string, line: number): void {
+    const key = `${finding.title}:${finding.file}:${finding.line}`;
+    if (this.findingKeys.has(key)) {
+      return;
+    }
+
+    this.findingKeys.add(key);
+    this.findings.push(finding);
+    this.generateBusinessLogicPoc(finding, vulnerableCode, line);
   }
 
   /**

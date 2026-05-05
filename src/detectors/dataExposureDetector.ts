@@ -4,27 +4,15 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 import { ProofOfConcept } from '../poc/types';
 
-const POC_CONFIG = {
-  includeCodeSnippets: true,
-  includePayloads: true,
-  includeCodeFlow: true,
-  includeRemediation: true,
-  verbosity: 'detailed' as const,
-  format: 'markdown' as const,
-  generateDiagrams: true
-};
-
 export class DataExposureDetector {
   private findings: Finding[] = [];
   private generatedPocs: ProofOfConcept[] = [];
   private filePath: string;
   private sourceFile: ts.SourceFile;
-  private parser: ASTParser;
 
-  constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
+  constructor(filePath: string, sourceFile: ts.SourceFile, _parser: ASTParser) {
     this.filePath = filePath;
     this.sourceFile = sourceFile;
-    this.parser = parser;
   }
 
   detect(): DetectorResult {
