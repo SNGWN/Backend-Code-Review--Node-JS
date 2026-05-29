@@ -14,6 +14,12 @@ Both modes emit the same Finding shape — same SARIF output, same baseline form
 fail-on / min-severity gating. AppSec teams ingest both code and log findings through one
 pipeline.
 
+A third mode — **`--mode search`** — runs a free-text Elasticsearch query across the
+entire cluster (or a specific container) for ad-hoc investigation. Useful for incident
+response: "is this customer ID anywhere in the last 7 days?" Output is the same SARIF /
+JSON shape; the matched term is redacted in the output so the artifact itself doesn't
+leak the value you searched for.
+
 ## What it produces
 
 - **Findings** with stable `ruleId`, CWE list, OWASP category, content-addressed fingerprint
@@ -93,6 +99,45 @@ Log-review inputs (flag → env var fallback):
 Log rules ship with PCI-DSS / UAE PDPL / OWASP-A09 mapping. The `--list-rules` output
 shows the full catalog including `LOG-*` rules with CWE references (CWE-532, CWE-359,
 CWE-256, etc.).
+
+### Free-text search (`--mode search`)
+
+For investigations — "is this customer ID anywhere in the last 7 days?". The query is
+sent as an Elasticsearch `query_string` (so the user gets full Lucene syntax: boolean
+operators, field qualifiers, wildcards).
+
+```bash
+# Across all indices the user can read (no container scope):
+KIBANA_PASSWORD=… code-review --mode search \
+  --kibana-url https://kibana.bank.ae:5601 \
+  --username appsec-reader \
+  --query 'alice@bank.ae OR "Emirates ID 784-1990-1234567-8"' \
+  --days 7 --max-hits 200
+
+# Scoped to a specific container:
+code-review --mode search --container payments-svc \
+  --query 'order_id:ORD-12345 AND status:failed' \
+  --days 30
+```
+
+Search inputs:
+
+| Flag | Env var | Required | Notes |
+| --- | --- | --- | --- |
+| `--kibana-url` | `KIBANA_URL` | yes | Base URL |
+| `--username` `-u` | `KIBANA_USERNAME` | yes | (or `KIBANA_API_KEY_ID` + `KIBANA_API_KEY`) |
+| stdin or env | `KIBANA_PASSWORD` | yes | Plaintext flag not supported |
+| `--query` `-q` | — | yes | ES `query_string` syntax |
+| `--container` | `CONTAINER_NAME` | no | Omit to search the entire cluster |
+| `--days` | `LOG_REVIEW_DAYS` | no | Default 7 for search |
+| `--max-hits` | — | no | Default 200 |
+| `--log-index` | `LOG_INDEX` | no | Default `*` (search-mode default) |
+
+The matched query term is **redacted in the output** — reviewers can locate WHERE the
+term appears without the artifact itself becoming a leak.
+
+Search mode always exits `0` when Kibana is reachable, regardless of hit count — it's
+an investigation tool, not a CI gate.
 
 ## CLI
 

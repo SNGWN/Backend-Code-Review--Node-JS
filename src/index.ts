@@ -9,16 +9,17 @@ import { Severity } from './types';
 import { Logger } from './utils/logger';
 import { KibanaClient, KibanaTransport } from './logs/kibanaClient';
 import { LogReviewAnalyzer } from './logs/logReviewAnalyzer';
+import { SearchAnalyzer, SearchReport } from './logs/searchAnalyzer';
 
 const yargs = require('yargs/yargs') as (args?: readonly string[]) => import('yargs').Argv;
 const { hideBin } = require('yargs/helpers') as typeof import('yargs/helpers');
 
 type OutputFormat = 'json' | 'text' | 'sarif';
-type RunMode = 'code' | 'logs';
+type RunMode = 'code' | 'logs' | 'search';
 
 const VALID_FORMATS: OutputFormat[] = ['json', 'text', 'sarif'];
 const VALID_SEVERITIES: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
-const VALID_MODES: RunMode[] = ['code', 'logs'];
+const VALID_MODES: RunMode[] = ['code', 'logs', 'search'];
 const VALID_TRANSPORTS: KibanaTransport[] = ['kibana-proxy', 'direct'];
 
 class CliUsageError extends Error {}
@@ -45,9 +46,14 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
     const argv = await yargs(args)
       .option('mode', {
         alias: 'm',
-        describe: `Review mode: 'code' (static SAST, default) or 'logs' (Kibana / Elasticsearch log review)`,
+        describe: `Review mode: 'code' (static SAST, default), 'logs' (Kibana / ES rule scan), 'search' (free-text Kibana query)`,
         type: 'string',
         default: 'code',
+      })
+      .option('query', {
+        alias: 'q',
+        describe: 'Free-text query — search mode only. Uses Elasticsearch query_string syntax. Container scope optional via --container.',
+        type: 'string',
       })
       .option('path', {
         alias: 'p',
@@ -208,7 +214,10 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
     let report: ExtendedAnalysisReport;
     let getBaselineFindings: () => Parameters<typeof Baseline.write>[1];
 
-    if (mode === 'logs') {
+    if (mode === 'search') {
+      const code = await runFreeTextSearch(argv);
+      return code;
+    } else if (mode === 'logs') {
       const logResult = await runLogReview(argv, { includeHeuristics, minSeverity, disabledRules });
       if (typeof logResult === 'number') return logResult;
       report = logResult.report;
@@ -444,6 +453,154 @@ async function runLogReview(
   } finally {
     process.off('SIGINT', onSigint);
   }
+}
+
+/**
+ * Free-text search across Kibana / Elasticsearch. Same auth / transport / abort
+ * controls as log-review mode but with no rule engine — just streams matching hits.
+ */
+async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number> {
+  const kibanaUrl = envOrFlag(argv['kibana-url'], 'KIBANA_URL') ?? envOrFlag(argv['elasticsearch-url'], 'ELASTICSEARCH_URL');
+  const username = envOrFlag(argv.username, 'KIBANA_USERNAME');
+  const container = envOrFlag(argv.container, 'CONTAINER_NAME');
+  const containerField = envOrFlag(argv['container-field'], 'CONTAINER_FIELD') ?? 'kubernetes.container.name';
+  // Search defaults to broad index — the user explicitly asked for "entire kibana".
+  const logIndex = envOrFlag(argv['log-index'], 'LOG_INDEX') ?? '*';
+  const days = Number(argv.days ?? process.env.LOG_REVIEW_DAYS ?? 7); // shorter default for search
+  const transport = parseTransport(argv.transport);
+  const maxHits = Number(argv['max-hits'] ?? 200);
+  const insecure = Boolean(argv.insecure);
+  const query = typeof argv.query === 'string' ? argv.query : '';
+
+  let password: string | undefined;
+  let apiKeyId: string | undefined;
+  let apiKey: string | undefined;
+  if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
+    apiKeyId = process.env.KIBANA_API_KEY_ID;
+    apiKey = process.env.KIBANA_API_KEY;
+  } else if (argv['password-stdin']) {
+    if (process.stdin.isTTY) {
+      throw new CliUsageError('--password-stdin requires stdin to be piped.');
+    }
+    password = await readPasswordFromStdin();
+  } else if (process.env.KIBANA_PASSWORD) {
+    password = process.env.KIBANA_PASSWORD;
+  }
+
+  const missing: string[] = [];
+  if (!kibanaUrl) missing.push('--kibana-url / KIBANA_URL');
+  if (!query.trim()) missing.push('--query / -q (the search string)');
+  const hasApiKey = !!apiKeyId && !!apiKey;
+  if (!hasApiKey) {
+    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
+    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin)');
+  }
+  if (missing.length > 0) {
+    throw new CliUsageError(`Search mode missing required inputs:\n  - ${missing.join('\n  - ')}`);
+  }
+  if (!Number.isFinite(days) || days <= 0 || days > 365) {
+    throw new CliUsageError(`--days must be a positive number ≤ 365 (got ${argv.days})`);
+  }
+
+  Logger.info(`
+╔═════════════════════════════════════════════╗
+║   Backend Code Review - Search Mode         ║
+╚═════════════════════════════════════════════╝
+`);
+  Logger.info(`📡 Kibana: ${kibanaUrl}  (transport: ${transport})`);
+  Logger.info(`🔎 Query : ${query}`);
+  Logger.info(`📂 Index : ${logIndex}${container ? `  Container: ${container}` : '  Container: (all)'}`);
+  Logger.info(`⏱  Window: last ${days} days  (max ${maxHits} hits)\n`);
+
+  if (insecure) {
+    Logger.warn('TLS certificate verification disabled (--insecure).');
+  }
+
+  const abortController = new AbortController();
+  const onSigint = () => {
+    Logger.warn('\nReceived SIGINT, flushing collected hits…');
+    abortController.abort();
+  };
+  process.on('SIGINT', onSigint);
+
+  const client = new KibanaClient({
+    baseUrl: kibanaUrl as string,
+    username, password, apiKeyId, apiKey,
+    transport, index: logIndex, containerField,
+    rejectUnauthorized: !insecure,
+    abortSignal: abortController.signal,
+    onProgress: (n) => Logger.info(`  matched ${n.toLocaleString()} hits so far…`),
+  });
+
+  try {
+    const ping = await client.ping();
+    if (!ping.ok) {
+      throw new CliUsageError(`Kibana/ES auth failed: HTTP ${ping.status}.`);
+    }
+  } catch (error) {
+    if (error instanceof CliUsageError) throw error;
+    throw new CliUsageError(`Could not reach Kibana/ES: ${(error as Error).message}`);
+  }
+
+  const now = new Date();
+  const from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+  const to = now.toISOString();
+
+  let report: SearchReport;
+  try {
+    const analyzer = new SearchAnalyzer(client);
+    report = await analyzer.search({
+      query: query.trim(),
+      containerName: container,
+      from, to,
+      maxHits,
+    });
+  } finally {
+    process.off('SIGINT', onSigint);
+  }
+
+  const format = parseFormat(argv.format);
+  const outputPath = (argv.output as string)
+    || `search-${Date.now()}.${format === 'text' ? 'txt' : 'json'}`;
+
+  try {
+    if (format === 'text') {
+      fs.writeFileSync(outputPath, formatSearchReportText(report), 'utf-8');
+    } else {
+      fs.writeFileSync(outputPath, JSON.stringify(report, null, 2), 'utf-8');
+    }
+    Logger.success(`Search results written to ${outputPath}`);
+  } catch (error) {
+    Logger.error('Failed to write search results', { error: (error as Error).message });
+    return 1;
+  }
+
+  Logger.info(`\n✓ ${report.totalHits} hit(s) matched`);
+  if (report.truncated) {
+    Logger.warn(`Results truncated at --max-hits (${maxHits}). Tighten the query or narrow --days.`);
+  }
+  // Search mode never sets exit=1 on "found hits" — it's an investigative tool, not
+  // a compliance gate. Exit 0 always (unless we couldn't reach Kibana).
+  return 0;
+}
+
+function formatSearchReportText(report: SearchReport): string {
+  const lines: string[] = [];
+  lines.push(`Kibana free-text search`);
+  lines.push(`Query     : ${report.query}`);
+  lines.push(`Container : ${report.containerName ?? '(all)'}`);
+  lines.push(`Window    : ${report.fromIso}  →  ${report.toIso}`);
+  lines.push(`Hits      : ${report.totalHits}${report.truncated ? ' (truncated)' : ''}`);
+  lines.push(`Duration  : ${report.durationMs} ms`);
+  lines.push('');
+  report.hits.forEach((hit, index) => {
+    lines.push(`[${index + 1}] ${hit.timestamp}  ${hit.index}/${hit.docId}`);
+    if (hit.container) lines.push(`    container: ${hit.container}`);
+    lines.push(`    kibana   : ${hit.kibanaUrl}`);
+    lines.push(`    excerpt  : ${hit.excerpt}`);
+    lines.push('');
+  });
+  return lines.join('\n');
 }
 
 function writeReport(

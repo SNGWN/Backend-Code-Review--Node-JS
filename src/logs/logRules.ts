@@ -1,6 +1,8 @@
 import { Finding, IssueCategory, Severity } from '../types';
 import { LogHit } from './kibanaClient';
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 /**
  * Log-scanner rules.
  *
@@ -597,6 +599,469 @@ export const ruleLogSensitiveStackPath: LogRule = (line) => {
   return out;
 };
 
+// ── Expanded coverage (1.1) ──────────────────────────────────────────────────
+
+/**
+ * Shannon entropy in bits-per-char for a string. Used to gate generic-secret matches —
+ * the value must be high-entropy (≥ 4 bits/char) before we call it a credential.
+ */
+function shannonEntropyBitsPerChar(s: string): number {
+  if (!s) return 0;
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let entropy = 0;
+  for (const c of counts.values()) {
+    const p = c / s.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function looksLikePlaceholder(value: string): boolean {
+  if (!value || value.length < 4) return true;
+  if (/^\*+$/.test(value)) return true;
+  if (/^\[?(redacted|masked|hidden|null|undefined|none|todo|fixme|example|sample)\]?$/i.test(value)) return true;
+  if (/^x{3,}$/i.test(value)) return true;
+  return false;
+}
+
+/** Build a match record helper. */
+function buildMatch(
+  ruleId: LogRuleMatch['ruleId'],
+  title: string,
+  description: string,
+  recommendation: string,
+  severity: Severity,
+  category: IssueCategory,
+  index: number,
+  fullLength: number,
+  matched: string
+): LogRuleMatch {
+  return {
+    ruleId, title, description, recommendation, severity, category,
+    start: index, end: index + fullLength, match: matched,
+  };
+}
+
+/** LOG-PII-006: customer full name. */
+export const ruleLogCustomerName: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(firstName|lastName|fullName|customerName|first_name|last_name|full_name|customer_name)"?\s*[:=]\s*"?([^,;'"\s]{2,}(?:[ \-][A-Z][A-Za-z]+){1,5})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    out.push(buildMatch('LOG-PII-006', 'Customer full name in log message',
+      `Customer-name field \`${m[1]}\` with multi-word value appears in this log line.`,
+      'Hash, pseudonymise, or truncate customer names. UAE PDPL Article 6.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, value));
+  }
+  return out;
+};
+
+/** LOG-PII-007: date of birth. */
+export const ruleLogDateOfBirth: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(dob|dateOfBirth|date_of_birth|birthDate|birth_date)"?\s*[:=]\s*"?(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PII-007', 'Date of birth in log message',
+      'A date-of-birth field with date value appears in this log line.',
+      'Replace DoB with an age band or hash.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-PII-008: physical address (labelled, heuristic). */
+export const ruleLogAddress: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(address|streetAddress|street_address|homeAddress|home_address|customer_address)"?\s*[:=]\s*"([A-Za-z0-9][A-Za-z0-9 ,.#\-/']{12,200})"/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    if (!/\d/.test(value)) continue; // require at least one digit (street numbers / unit)
+    out.push(buildMatch('LOG-PII-008', 'Physical address in log message',
+      'A labelled address field with a multi-word, digit-bearing value appears in this log line.',
+      'Strip address fields before logging.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, value));
+  }
+  return out;
+};
+
+/** LOG-ACCT-001: bank account number (labelled). */
+export const ruleLogBankAccountNumber: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(account_?number|acc_?no|accountId)"?\s*[:=]\s*"?(\d{8,18})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-ACCT-001', 'Bank account number in log message',
+      'A labelled bank-account-number field appears in this log line.',
+      'Mask all but last 4 of account numbers. CBUAE Consumer Protection § B.4.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-ACCT-002: sort code / routing number. */
+export const ruleLogSortRoutingCode: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Sort codes: 6 digits with optional dashes (e.g. 12-34-56). Routing: 9 digits.
+  const pattern = /\b(sort_?code|routing_?number|aba)"?\s*[:=]\s*"?(\d{2,3}[- ]?\d{2,3}[- ]?\d{2,4}|\d{6,9})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-ACCT-002', 'Sort code / routing number in log message',
+      'A labelled sort-code / routing-number field appears in this log line.',
+      'Mask routing identifiers when paired with account numbers.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-ACCT-003: SWIFT / BIC code. */
+export const ruleLogSwiftBic: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // SWIFT/BIC format: 4 letters bank + 2 letters country + 2 alphanumeric location + optional 3 alphanumeric branch.
+  const pattern = /\b(swift|bic|swiftCode|bicCode)"?\s*[:=]\s*"?([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-ACCT-003', 'SWIFT / BIC code in log message',
+      'A labelled SWIFT/BIC field with valid format appears in this log line.',
+      'Mask SWIFT/BIC paired with account numbers.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-DOC-001: UAE driving license (labelled). */
+export const ruleLogUaeDrivingLicense: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // UAE DL: 7-9 digit license number, prefixed by emirate code (AD/DXB/SHJ/AJM/UAQ/RAK/FUJ).
+  // Most commonly logged as plain digits with a label.
+  const pattern = /\b(driving_?license|driver_?license|dl_?no|dl_?number|drivingLicense)"?\s*[:=]\s*"?([A-Z]{0,3}[ -]?\d{7,9})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-DOC-001', 'UAE driving license number in log message',
+      'A labelled driving-license field appears in this log line.',
+      'Never log driving license numbers in plaintext. UAE PDPL Article 24.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-DOC-002: UAE visa / residence permit. */
+export const ruleLogUaeVisaPermit: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Common shapes: 101/2020/3000234, AE-2020-123456, RP-12345678.
+  const pattern = /\b(visa|visa_?no|residence_?permit|residency_?permit|residence_?id)"?\s*[:=]\s*"?(\d{1,3}\/\d{1,4}\/\d{4,12}|[A-Z]{1,3}[-]?\d{4,12})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-DOC-002', 'UAE visa / residence permit number in log message',
+      'A labelled visa / residence-permit field appears in this log line.',
+      'Never log visa numbers in plaintext.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-DOC-003: UAE Tax Registration Number (15-digit). */
+export const ruleLogUaeTrn: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(trn|tax_?reg(?:istration)?_?(?:number|no))"?\s*[:=]\s*"?(\d{15})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-DOC-003', 'Tax Registration Number (TRN) in log message',
+      'A labelled TRN field with 15-digit value appears in this log line.',
+      'Mask TRN before logging.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-DOC-004: generic national ID. */
+export const ruleLogGenericNationalId: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(national_?id|nationalId|id_?number|government_?id)"?\s*[:=]\s*"?([A-Z0-9][A-Z0-9-]{6,20})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    // Skip if it's the UAE Emirates ID shape — already covered by LOG-PII-001.
+    if (/^784/.test(value.replace(/[-]/g, ''))) continue;
+    out.push(buildMatch('LOG-DOC-004', 'Generic national ID in log message',
+      'A labelled national-ID field appears in this log line.',
+      'Hash or pseudonymise national identifiers.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, value));
+  }
+  return out;
+};
+
+/** LOG-PCI-005: card expiry. */
+export const ruleLogCardExpiry: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(exp|expiry|expiration|cardExpiry|card_expiry|exp_?date)"?\s*[:=]\s*"?(0[1-9]|1[0-2])[\/\-](\d{2}|\d{4})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PCI-005', 'Card expiry date in log message',
+      'A labelled card-expiry field with MM/YY or MM/YYYY value appears in this log line.',
+      'Strip expiry alongside PAN. PCI-DSS Req 3.3.',
+      'MEDIUM', 'LOG_PCI', m.index, m[0].length, `${m[2]}/${m[3]}`));
+  }
+  return out;
+};
+
+/** LOG-PCI-006: cardholder name. */
+export const ruleLogCardholderName: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(cardholder|cardholderName|card_holder|holder_name)"?\s*[:=]\s*"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,4})"/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    out.push(buildMatch('LOG-PCI-006', 'Cardholder name in log message',
+      'A labelled cardholder-name field with multi-word value appears in this log line.',
+      'PCI-DSS Req 3.4 — cardholder name + PAN must be rendered unreadable in storage.',
+      'MEDIUM', 'LOG_PCI', m.index, m[0].length, value));
+  }
+  return out;
+};
+
+/** LOG-FIN-001: account balance. */
+export const ruleLogAccountBalance: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Simplified pattern — match a digit run with optional decimal, optional currency.
+  const pattern = /\b(balance|availableBalance|available_balance|current_balance|ledger_balance)"?\s*[:=]\s*"?(\d[\d,]*(?:\.\d{1,4})?)\s*"?\s*(AED|USD|EUR|GBP|SAR|JPY|INR|CNY)?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const value = m[2];
+    const currency = m[3];
+    // Require either a currency or a decimal point (so we don't fire on `balance: 0`).
+    if (!currency && !value.includes('.')) continue;
+    if (Number(value.replace(/,/g, '')) === 0) continue;
+    out.push(buildMatch('LOG-FIN-001', 'Account balance disclosed in log message',
+      'A labelled balance field with a numeric value appears in this log line.',
+      'Never log customer balances in plaintext. Use buckets/deciles if telemetry is required.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, value));
+  }
+  return out;
+};
+
+/** Public IPv4 helper — RFC 1918 / 100.64 / loopback are NOT public. */
+function isPublicIPv4(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) return false;
+  const [a, b] = parts;
+  if (a === 10) return false;
+  if (a === 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false;
+  if (a >= 224) return false; // multicast / reserved
+  if (a === 0) return false;
+  return true;
+}
+
+/** LOG-NET-001: customer IPv4 in customer-context field. */
+export const ruleLogCustomerIPv4: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(client_ip|source_ip|src_ip|remote_addr|customer_ip|user_ip|x_forwarded_for|real_ip|origin_ip)"?\s*[:=]\s*"?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const ip = m[2];
+    if (!isPublicIPv4(ip)) continue;
+    out.push(buildMatch('LOG-NET-001', 'Customer IP address in log message',
+      'A public IPv4 in a customer-context field appears in this log line.',
+      'Hash customer IPs or retain only the /24.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, ip));
+  }
+  return out;
+};
+
+/** LOG-NET-002: IPv6 in customer context. */
+export const ruleLogIPv6: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Allow `::` zero-compression (consecutive colons), variable hex segment lengths.
+  const pattern = /\b(client_ip|source_ip|src_ip|remote_addr|customer_ip|user_ip|x_forwarded_for|real_ip|origin_ip)"?\s*[:=]\s*"?((?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{1,4})/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const ip = m[2];
+    // Exclude IPv6 loopback and link-local.
+    if (ip === '::1' || /^fe80:/i.test(ip)) continue;
+    out.push(buildMatch('LOG-NET-002', 'IPv6 address in customer context',
+      'An IPv6 address in a customer-context field appears in this log line.',
+      'Hash customer IPv6 or retain only the /48.',
+      'MEDIUM', 'LOG_PII', m.index, m[0].length, ip));
+  }
+  return out;
+};
+
+/** LOG-NET-003: internal RFC-1918 / 100.64 IP exposure (heuristic). */
+export const ruleLogInternalIp: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Any RFC-1918 / 100.64 IP appearing in a log line.
+  const pattern = /\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[0-1]\d|12[0-7])\.\d{1,3}\.\d{1,3})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-NET-003', 'Internal RFC-1918 IP address exposed in log message',
+      'An RFC-1918 / 100.64 address appears in this log line.',
+      'Confirm log retention boundary does not expose internal topology to third parties.',
+      'LOW', 'LOG_OPS', m.index, m[0].length, m[1]));
+  }
+  return out;
+};
+
+/** LOG-SEC-005..007: OAuth client_id / client_secret / refresh_token. */
+export const ruleLogOAuthCreds: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+
+  // client_secret (CRITICAL)
+  const secretPattern = /\b(client[_-]?secret)"?\s*[:=]\s*"?([^\s,;'"]{8,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = secretPattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-005', 'OAuth client_secret in log message',
+      'A labelled `client_secret=` field with a non-trivial value appears in this log line.',
+      'Rotate the OAuth client secret.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+
+  // client_id (MEDIUM)
+  const idPattern = /\b(client[_-]?id)"?\s*[:=]\s*"?([A-Za-z0-9._\-]{8,})/gi;
+  while ((m = idPattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-006', 'OAuth client_id in log message',
+      'A labelled `client_id=` field with a non-trivial value appears in this log line.',
+      'Confirm the corresponding client_secret has not also leaked.',
+      'MEDIUM', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+
+  // refresh_token (CRITICAL)
+  const refreshPattern = /\b(refresh[_-]?token)"?\s*[:=]\s*"?([A-Za-z0-9._\-/+=]{16,})/gi;
+  while ((m = refreshPattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-007', 'Refresh token in log message',
+      'A labelled `refresh_token=` field with a non-trivial value appears in this log line.',
+      'Revoke the leaked refresh token.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+
+  return out;
+};
+
+/** LOG-SEC-008: session token. */
+export const ruleLogSessionToken: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(session[_-]?token|sessionId|session_id|sid|jsessionid|phpsessid)"?\s*[:=]\s*"?([A-Za-z0-9._\-/+=]{12,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-008', 'Session token in log message',
+      'A labelled session-token field with a session-shaped value appears in this log line.',
+      'Invalidate sessions appearing in log volumes.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-SEC-009: CSRF / XSRF token. */
+export const ruleLogCsrfToken: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(csrf[_-]?token|xsrf[_-]?token|_csrf|anti[_-]?forgery)"?\s*[:=]\s*"?([A-Za-z0-9._\-/+=]{16,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-009', 'CSRF / XSRF token in log message',
+      'A labelled CSRF/XSRF token field appears in this log line.',
+      'CSRF tokens are session-scoped — leaked tokens enable forged-request chains.',
+      'HIGH', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-SEC-010: SSH key (public or private). */
+export const ruleLogSshKey: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Real SSH keys are hundreds of chars; we set the threshold low enough to catch
+  // truncated copies that still expose the key prefix shape.
+  const pattern = /\b(ssh-(?:rsa|dss|ed25519|ecdsa-sha2-nistp(?:256|384|521)))\s+[A-Za-z0-9+/]{40,}={0,2}/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-SEC-010', 'SSH public/private key block in log message',
+      'An OpenSSH-format key block appears in this log line.',
+      'Confirm whether the key was customer-context or server-context. Rotate if private.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-SEC-011: Azure SAS token. */
+export const ruleLogAzureSas: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Match `?sv=YYYY-MM-DD…&sig=…`. Allow any URL params between `sv` and `sig`.
+  const pattern = /\?sv=\d{4}-\d{2}-\d{2}[^\s"']*?&sig=[A-Za-z0-9%+/=_-]{10,}/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-SEC-011', 'Azure SAS token in log message',
+      'An Azure Shared Access Signature appears in this log line.',
+      'Rotate the SAS token; reduce TTL and scope of new tokens.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-SEC-012: GCP service account JSON. */
+export const ruleLogGcpServiceAccount: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Look for the type+private_key combination on the same line (JSON would normally
+  // line-feed but log shippers often collapse to one line).
+  const pattern = /"type"\s*:\s*"service_account"[^]{1,400}?"private_key"\s*:\s*"-----BEGIN/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-SEC-012', 'GCP service account JSON in log message',
+      'A GCP service-account JSON appears in this log line.',
+      'Disable the service account key immediately; rotate.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-SEC-013: public / API / access token (labelled). */
+export const ruleLogPublicOrApiToken: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(public[_-]?token|api[_-]?token|access[_-]?token|app[_-]?token|integration[_-]?token)"?\s*[:=]\s*"?([A-Za-z0-9._\-/+=]{16,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    if (looksLikePlaceholder(m[2])) continue;
+    out.push(buildMatch('LOG-SEC-013', 'Public token / API token in log message',
+      'A labelled token field with a non-trivial value appears in this log line.',
+      'Revoke the leaked token.',
+      'HIGH', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
+/** LOG-SEC-014: generic high-entropy *_secret= / *_key= / *_token= */
+export const ruleLogGenericHighEntropySecret: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b([A-Za-z][A-Za-z0-9_-]{1,40}(?:secret|key|token|password|credential))"?\s*[:=]\s*"?([A-Za-z0-9._\-/+=]{24,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    const labelKey = m[1].toLowerCase();
+    // Skip labels already covered by tighter rules to avoid double-reporting.
+    if (/(jwt|bearer|access[_-]?token|refresh[_-]?token|public[_-]?token|api[_-]?token|client[_-]?secret|client[_-]?id|cardholder|expiry|password|passwd|pwd|csrf|xsrf|session|sid)/.test(labelKey)) continue;
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    if (shannonEntropyBitsPerChar(value) < 3.6) continue;
+    out.push(buildMatch('LOG-SEC-014', 'Generic high-entropy secret in log message',
+      `A labelled \`${m[1]}=\` field carrying a high-entropy value appears in this log line.`,
+      'Rotate the exposed credential; add a redaction filter to the code path that logged it.',
+      'HIGH', 'LOG_SECRET', m.index, m[0].length, value));
+  }
+  return out;
+};
+
 export const ALL_LOG_RULES: LogRule[] = [
   ruleLogPan,
   ruleLogUrlEncodedPan,
@@ -615,6 +1080,31 @@ export const ALL_LOG_RULES: LogRule[] = [
   ruleLogPrivateKey,
   ruleLogDbConnError,
   ruleLogSensitiveStackPath,
+  // ── Expanded coverage ─────────────────────────────────────────────────
+  ruleLogCustomerName,
+  ruleLogDateOfBirth,
+  ruleLogAddress,
+  ruleLogBankAccountNumber,
+  ruleLogSortRoutingCode,
+  ruleLogSwiftBic,
+  ruleLogUaeDrivingLicense,
+  ruleLogUaeVisaPermit,
+  ruleLogUaeTrn,
+  ruleLogGenericNationalId,
+  ruleLogCardExpiry,
+  ruleLogCardholderName,
+  ruleLogAccountBalance,
+  ruleLogCustomerIPv4,
+  ruleLogIPv6,
+  ruleLogInternalIp,
+  ruleLogOAuthCreds,
+  ruleLogSessionToken,
+  ruleLogCsrfToken,
+  ruleLogSshKey,
+  ruleLogAzureSas,
+  ruleLogGcpServiceAccount,
+  ruleLogPublicOrApiToken,
+  ruleLogGenericHighEntropySecret,
 ];
 
 /** Run every rule against a single line. */

@@ -23,6 +23,32 @@ of 2021)**. Each rule also carries CWE references in SARIF output.
 | LOG-SEC-004 | PEM private key in log | Req 3.5, 8.2 | Art. 21 | CWE-532, CWE-798 |
 | LOG-OPS-001 | DB connection string with credentials | Req 8.2 | Art. 21 | CWE-209, CWE-532 |
 | LOG-OPS-002 | Stack trace with sensitive path | — | — | CWE-209 |
+| LOG-PII-006 | Customer full name | — | Art. 6 | CWE-359 |
+| LOG-PII-007 | Date of birth | — | Art. 6, Art. 24 | CWE-359 |
+| LOG-PII-008 | Physical address (heuristic) | — | Art. 6 | CWE-359 |
+| LOG-ACCT-001 | Bank account number | Req 3.4 (indirect) | Art. 6, CBUAE CPS § B.4 | CWE-359 |
+| LOG-ACCT-002 | Sort code / routing number | — | CBUAE CPS § B.4 | CWE-359 |
+| LOG-ACCT-003 | SWIFT / BIC (heuristic) | — | CBUAE CPS § B.4 | CWE-359 |
+| LOG-DOC-001 | UAE driving license | — | Art. 24 | CWE-359 |
+| LOG-DOC-002 | UAE visa / residence permit | — | Art. 24 | CWE-359 |
+| LOG-DOC-003 | UAE TRN (heuristic) | — | FTA Confidentiality | CWE-359 |
+| LOG-DOC-004 | Generic national ID (heuristic) | — | Art. 24 | CWE-359 |
+| LOG-PCI-005 | Card expiry | Req 3.3 | — | CWE-532, CWE-359 |
+| LOG-PCI-006 | Cardholder name | Req 3.4 | — | CWE-532, CWE-359 |
+| LOG-FIN-001 | Account balance (heuristic) | — | CBUAE CPS | CWE-359 |
+| LOG-NET-001 | Customer IPv4 | — | Art. 6 | CWE-359 |
+| LOG-NET-002 | Customer IPv6 (heuristic) | — | Art. 6 | CWE-359 |
+| LOG-NET-003 | Internal RFC-1918 IP (heuristic) | — | — | CWE-200 |
+| LOG-SEC-005 | OAuth client_secret | Req 8.2 | Art. 21 | CWE-532, CWE-798 |
+| LOG-SEC-006 | OAuth client_id (heuristic) | — | — | CWE-532 |
+| LOG-SEC-007 | Refresh token | Req 8.2 | Art. 21 | CWE-532 |
+| LOG-SEC-008 | Session token | Req 8.2 | Art. 21 | CWE-532 |
+| LOG-SEC-009 | CSRF token (heuristic) | — | — | CWE-532 |
+| LOG-SEC-010 | SSH key block | Req 3.5, 8.2 | Art. 21 | CWE-532, CWE-798 |
+| LOG-SEC-011 | Azure SAS token | Req 8.2 | Art. 21 | CWE-532, CWE-798 |
+| LOG-SEC-012 | GCP service-account JSON | Req 8.2 | Art. 21 | CWE-532, CWE-798 |
+| LOG-SEC-013 | Public / API / access token | Req 8.2 | Art. 21 | CWE-532 |
+| LOG-SEC-014 | Generic high-entropy secret (heuristic) | Req 8.2 | Art. 21 | CWE-532 |
 
 ## Code-review rules (mode=code)
 

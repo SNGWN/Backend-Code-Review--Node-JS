@@ -97,6 +97,23 @@ export interface SearchOptions {
   maxHits?: number;
 }
 
+/**
+ * Free-text search options. Used by `--mode search` for investigative lookups across
+ * the entire cluster OR a specific container.
+ */
+export interface FreeTextSearchOptions {
+  /** The user-supplied query string. Sent to ES as a `query_string`. */
+  query: string;
+  /** ISO range start. */
+  from: string;
+  /** ISO range end (exclusive). */
+  to: string;
+  /** Optional container scope. When omitted, searches all containers visible to the user. */
+  containerName?: string;
+  pageSize?: number;
+  maxHits?: number;
+}
+
 const DEFAULT_TIMESTAMP_FIELD = '@timestamp';
 const DEFAULT_CONTAINER_FIELD = 'kubernetes.container.name';
 const DEFAULT_PAGE_SIZE = 500;
@@ -201,6 +218,59 @@ export class KibanaClient {
   }
 
   /**
+   * Free-text search across the configured index pattern. Streams hits like
+   * `streamHits()` but with a user-supplied `query_string` and optional container scope.
+   * When `containerName` is omitted, searches the entire index (every container the
+   * user has read access to).
+   */
+  async *searchFreeText(options: FreeTextSearchOptions): AsyncIterableIterator<LogHit> {
+    const pageSize = options.pageSize ?? 100;
+    const maxHits = options.maxHits ?? 1_000;
+    let yielded = 0;
+    let searchAfter: unknown[] | undefined;
+
+    while (yielded < maxHits) {
+      if (this.abortSignal?.aborted) {
+        throw new Error('Search aborted by caller');
+      }
+      const body = this.buildFreeTextBody(options, pageSize, searchAfter);
+      const response = await this.search(body);
+
+      const hits = (response.hits?.hits ?? []) as Array<{
+        _id: string;
+        _index: string;
+        _source: Record<string, unknown>;
+        sort?: unknown[];
+      }>;
+      if (hits.length === 0) return;
+
+      for (const hit of hits) {
+        if (yielded >= maxHits) return;
+        if (this.abortSignal?.aborted) {
+          throw new Error('Search aborted by caller');
+        }
+        const source = hit._source ?? {};
+        yield {
+          _id: hit._id,
+          _index: hit._index,
+          source,
+          message: this.resolveMessage(source),
+          timestamp: this.resolveTimestamp(source),
+        };
+        yielded += 1;
+        if (this.onProgress && yielded % 100 === 0) {
+          try { this.onProgress(yielded); } catch { /* swallow */ }
+        }
+      }
+
+      const last = hits[hits.length - 1];
+      if (!last.sort) return;
+      searchAfter = last.sort;
+      if (hits.length < pageSize) return;
+    }
+  }
+
+  /**
    * Single-shot health check. Useful for the CLI to fail fast when credentials are wrong
    * before kicking off a 15-day scan.
    */
@@ -239,6 +309,47 @@ export class KibanaClient {
         },
       },
       // Only pull fields we actually inspect — reduces transfer.
+      _source: ['message', 'log', 'msg', 'event.original', this.timestampField, this.containerField],
+    };
+    if (searchAfter) body.search_after = searchAfter;
+    return body;
+  }
+
+  private buildFreeTextBody(options: FreeTextSearchOptions, pageSize: number, searchAfter?: unknown[]): Record<string, unknown> {
+    const filter: unknown[] = [
+      {
+        range: {
+          [this.timestampField]: { gte: options.from, lt: options.to },
+        },
+      },
+    ];
+    if (options.containerName) {
+      filter.push({
+        term: { [`${this.containerField}.keyword`]: options.containerName },
+      });
+    }
+
+    const body: Record<string, unknown> = {
+      size: pageSize,
+      sort: [
+        { [this.timestampField]: { order: 'desc' } },
+        { _id: 'asc' },
+      ],
+      query: {
+        bool: {
+          must: [
+            {
+              query_string: {
+                query: options.query,
+                fields: ['message', 'msg', 'log.message', 'event.original', '*'],
+                default_operator: 'AND',
+                lenient: true,
+              },
+            },
+          ],
+          filter,
+        },
+      },
       _source: ['message', 'log', 'msg', 'event.original', this.timestampField, this.containerField],
     };
     if (searchAfter) body.search_after = searchAfter;

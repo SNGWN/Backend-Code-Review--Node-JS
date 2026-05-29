@@ -15,6 +15,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { scanLogLine } from '../src/logs/logRules';
+import { listRules } from '../src/rules/registry';
 
 const corpusPath = path.join(__dirname, 'fixtures', 'fp-audit-logs', 'safe-log-lines.txt');
 
@@ -35,12 +36,15 @@ describe('Log-mode FP audit corpus', () => {
     const corpus = loadCorpusLines();
     expect(corpus.length).toBeGreaterThan(10);
 
+    // Pull the heuristic ruleIds from the registry so this stays accurate as we add
+    // rules. The default-mode contract: only non-heuristic LOG-* rules must fire zero.
+    const HEURISTIC_RULES = new Set(
+      listRules().filter((r) => r.heuristic).map((r) => r.id)
+    );
+
     const offenders: Array<{ lineNumber: number; line: string; rules: string[] }> = [];
     for (const { lineNumber, line } of corpus) {
       const matches = scanLogLine(line);
-      // Heuristic rules (LOG-PII-003 email, LOG-PII-005 passport, LOG-OPS-002 stack
-      // path) are off by default for code mode; for the corpus we exclude them too.
-      const HEURISTIC_RULES = new Set(['LOG-PII-003', 'LOG-PII-005', 'LOG-OPS-002']);
       const nonHeuristic = matches.filter((m) => !HEURISTIC_RULES.has(m.ruleId));
       if (nonHeuristic.length > 0) {
         offenders.push({
