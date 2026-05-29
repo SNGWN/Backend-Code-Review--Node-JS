@@ -48,7 +48,6 @@ bcr-self.sarif
 coverage/
 .coverage
 tests/generated-phase1-pocs/
-tests/fixtures/**/*.js
 tests/fixtures/**/*.js.map
 
 # Misc

@@ -80,6 +80,16 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
         type: 'boolean',
         default: false,
       })
+      .option('api-key-stdin', {
+        describe: 'Read Kibana / ES API key from stdin. Otherwise set KIBANA_API_KEY (+ KIBANA_API_KEY_ID).',
+        type: 'boolean',
+        default: false,
+      })
+      .option('bearer-token-stdin', {
+        describe: 'Read SSO bearer token from stdin (Okta / PingFederate / Cognito flow). Otherwise set KIBANA_BEARER_TOKEN.',
+        type: 'boolean',
+        default: false,
+      })
       .option('container', {
         describe: 'Container name to filter (e.g. payments-svc). Env: CONTAINER_NAME',
         type: 'string',
@@ -365,15 +375,26 @@ async function runLogReview(
   let password: string | undefined;
   let apiKeyId: string | undefined;
   let apiKey: string | undefined;
+  let bearerToken: string | undefined;
 
-  if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
+  // Priority: explicit stdin flags → bearer env → api-key env → password env.
+  if (argv['bearer-token-stdin']) {
+    if (process.stdin.isTTY) throw new CliUsageError('--bearer-token-stdin requires stdin to be piped.');
+    bearerToken = await readPasswordFromStdin();
+  } else if (argv['api-key-stdin']) {
+    if (process.stdin.isTTY) throw new CliUsageError('--api-key-stdin requires stdin to be piped.');
+    apiKey = await readPasswordFromStdin();
     apiKeyId = process.env.KIBANA_API_KEY_ID;
-    apiKey = process.env.KIBANA_API_KEY;
   } else if (argv['password-stdin']) {
     if (process.stdin.isTTY) {
       throw new CliUsageError('--password-stdin requires stdin to be piped (e.g. `echo $PWD | bcr --password-stdin ...`). Detected a TTY.');
     }
     password = await readPasswordFromStdin();
+  } else if (process.env.KIBANA_BEARER_TOKEN) {
+    bearerToken = process.env.KIBANA_BEARER_TOKEN;
+  } else if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
+    apiKeyId = process.env.KIBANA_API_KEY_ID;
+    apiKey = process.env.KIBANA_API_KEY;
   } else if (process.env.KIBANA_PASSWORD) {
     password = process.env.KIBANA_PASSWORD;
   }
@@ -381,11 +402,12 @@ async function runLogReview(
   const missing: string[] = [];
   if (!kibanaUrl) missing.push('--kibana-url / KIBANA_URL');
   if (!container) missing.push('--container / CONTAINER_NAME');
-  // Auth: either API-key pair OR username + password.
+  // Auth: bearer token OR API-key pair OR username + password.
+  const hasBearer = !!bearerToken;
   const hasApiKey = !!apiKeyId && !!apiKey;
-  if (!hasApiKey) {
-    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
-    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin, or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
+  if (!hasBearer && !hasApiKey) {
+    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY, or KIBANA_BEARER_TOKEN)');
+    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin, or KIBANA_API_KEY_ID + KIBANA_API_KEY, or --bearer-token-stdin)');
   }
   if (missing.length > 0) {
     throw new CliUsageError(`Log review missing required inputs:\n  - ${missing.join('\n  - ')}`);
@@ -407,13 +429,18 @@ async function runLogReview(
     Logger.warn('TLS certificate verification disabled (--insecure). Use only with trusted private CAs.');
   }
 
-  // SIGINT → graceful abort: flush whatever findings we already have.
+  // SIGINT / SIGTERM → graceful abort: flush whatever findings we already have.
+  // SIGTERM is what Docker / k8s sends on graceful shutdown; missing it leaves the
+  // scanner running until the orchestrator force-kills.
   const abortController = new AbortController();
-  const onSigint = () => {
-    Logger.warn('\nReceived SIGINT, finishing in-flight requests and flushing findings…');
+  const onSignal = (sig: string) => () => {
+    Logger.warn(`\nReceived ${sig}, finishing in-flight requests and flushing findings…`);
     abortController.abort();
   };
+  const onSigint = onSignal('SIGINT');
+  const onSigterm = onSignal('SIGTERM');
   process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
 
   const client = new KibanaClient({
     baseUrl: kibanaUrl as string,
@@ -421,6 +448,7 @@ async function runLogReview(
     password,
     apiKeyId,
     apiKey,
+    bearerToken,
     transport,
     index: logIndex,
     containerField,
@@ -464,6 +492,7 @@ async function runLogReview(
     };
   } finally {
     process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
   }
 }
 
@@ -487,14 +516,23 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
   let password: string | undefined;
   let apiKeyId: string | undefined;
   let apiKey: string | undefined;
-  if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
+  let bearerToken: string | undefined;
+
+  if (argv['bearer-token-stdin']) {
+    if (process.stdin.isTTY) throw new CliUsageError('--bearer-token-stdin requires stdin to be piped.');
+    bearerToken = await readPasswordFromStdin();
+  } else if (argv['api-key-stdin']) {
+    if (process.stdin.isTTY) throw new CliUsageError('--api-key-stdin requires stdin to be piped.');
+    apiKey = await readPasswordFromStdin();
+    apiKeyId = process.env.KIBANA_API_KEY_ID;
+  } else if (argv['password-stdin']) {
+    if (process.stdin.isTTY) throw new CliUsageError('--password-stdin requires stdin to be piped.');
+    password = await readPasswordFromStdin();
+  } else if (process.env.KIBANA_BEARER_TOKEN) {
+    bearerToken = process.env.KIBANA_BEARER_TOKEN;
+  } else if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
     apiKeyId = process.env.KIBANA_API_KEY_ID;
     apiKey = process.env.KIBANA_API_KEY;
-  } else if (argv['password-stdin']) {
-    if (process.stdin.isTTY) {
-      throw new CliUsageError('--password-stdin requires stdin to be piped.');
-    }
-    password = await readPasswordFromStdin();
   } else if (process.env.KIBANA_PASSWORD) {
     password = process.env.KIBANA_PASSWORD;
   }
@@ -502,10 +540,11 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
   const missing: string[] = [];
   if (!kibanaUrl) missing.push('--kibana-url / KIBANA_URL');
   if (!query.trim()) missing.push('--query / -q (the search string)');
+  const hasBearer = !!bearerToken;
   const hasApiKey = !!apiKeyId && !!apiKey;
-  if (!hasApiKey) {
-    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
-    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin)');
+  if (!hasBearer && !hasApiKey) {
+    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY, or KIBANA_BEARER_TOKEN)');
+    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin, or --bearer-token-stdin)');
   }
   if (missing.length > 0) {
     throw new CliUsageError(`Search mode missing required inputs:\n  - ${missing.join('\n  - ')}`);
@@ -536,11 +575,16 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
     Logger.warn('\nReceived SIGINT, flushing collected hits…');
     abortController.abort();
   };
+  const onSigterm = () => {
+    Logger.warn('\nReceived SIGTERM, flushing collected hits…');
+    abortController.abort();
+  };
   process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
 
   const client = new KibanaClient({
     baseUrl: kibanaUrl as string,
-    username, password, apiKeyId, apiKey,
+    username, password, apiKeyId, apiKey, bearerToken,
     transport, index: logIndex, containerField,
     rejectUnauthorized: !insecure,
     abortSignal: abortController.signal,

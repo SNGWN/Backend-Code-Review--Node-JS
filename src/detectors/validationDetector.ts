@@ -355,6 +355,24 @@ export class ParameterValidationDetector {
 
 
   private referencesTaintedInput(node: ts.Node): boolean {
+    // Walk the node for any identifier whose declaration we marked tainted via
+    // buildTaintMap. Closes the dominant cross-file shape:
+    // `const id = getId(req); db.query(\`…${id}…\`)`.
+    if (this.taintedVariables.size > 0) {
+      let foundLocal = false;
+      const localTainted = this.taintedVariables;
+      const validatedSet = this.validatedVariables;
+      const walk = (n: ts.Node): void => {
+        if (foundLocal) return;
+        if (ts.isIdentifier(n) && localTainted.has(n.text) && !validatedSet.has(n.text)) {
+          foundLocal = true;
+          return;
+        }
+        n.forEachChild(walk);
+      };
+      walk(node);
+      if (foundLocal) return true;
+    }
     if (this.taintTracker?.isTainted(node)) {
       // Cross-check the validated-variables set: if the AST identifier resolves to a
       // declaration the user explicitly passed through joi/yup/zod/etc., respect that.

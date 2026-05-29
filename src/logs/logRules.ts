@@ -76,9 +76,24 @@ export function passesIbanMod97(iban: string): boolean {
 }
 
 /**
+ * PCI-DSS compliant masking. PAN-shaped digit runs (13-19 digits) are masked as
+ * "first 6 + middle masked + last 4" per Req 3.3, giving SOC analysts enough to
+ * triage (BIN-prefix issuer ID + last 4 for customer correlation) without
+ * exceeding the retention permission. Other matches use first-2 + last-2.
+ */
+function maskMatchedValue(matched: string): string {
+  if (matched.length <= 4) return '*'.repeat(matched.length);
+  const digitsOnly = matched.replace(/\D/g, '');
+  if (digitsOnly.length >= 13 && digitsOnly.length <= 19) {
+    // PCI-DSS first-6-last-4: keep brand prefix + last 4 for correlation.
+    return matched.slice(0, 6) + '*'.repeat(Math.max(0, matched.length - 10)) + matched.slice(-4);
+  }
+  return matched.slice(0, 2) + '*'.repeat(Math.max(0, matched.length - 4)) + matched.slice(-2);
+}
+
+/**
  * Builds a redacted excerpt of the matched line. We keep ~40 chars of context on each
- * side but mask the matched substring (keep first 2 + last 2 chars). PCI-DSS rules
- * forbid retaining the full PAN even in a security tool's output.
+ * side but mask the matched substring. PCI-DSS Req 3.3 allows first 6 + last 4 of PAN.
  *
  * Multi-rule safety: if `otherMatches` is provided, ALL other rule matches that
  * overlap the excerpt window are ALSO masked. Without this, a Bearer-finding's
@@ -117,10 +132,7 @@ export function buildRedactedExcerpt(
   let cursor = left;
   for (const interval of merged) {
     out += line.slice(cursor, interval.start);
-    const matched = line.slice(interval.start, interval.end);
-    out += matched.length <= 4
-      ? '*'.repeat(matched.length)
-      : matched.slice(0, 2) + '*'.repeat(Math.max(0, matched.length - 4)) + matched.slice(-2);
+    out += maskMatchedValue(line.slice(interval.start, interval.end));
     cursor = interval.end;
   }
   out += line.slice(cursor, right);
@@ -1143,6 +1155,48 @@ export const ruleLogPresignedUrl: LogRule = (line) => {
   return out;
 };
 
+/** LOG-PII-011: UK National Insurance Number. */
+export const ruleLogUkNi: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b[A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D]\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PII-009', 'UK National Insurance number in log message',
+      'A UK NI-shaped value appears in this log line.',
+      'Mask UK NI numbers; HMRC retention rules apply.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-PII-012: Pakistani CNIC. */
+export const ruleLogPakistaniCnic: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b\d{5}-\d{7}-\d\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PII-009', 'Pakistani CNIC in log message',
+      'A CNIC-shaped value appears in this log line.',
+      'Mask CNIC; NADRA classifies as sensitive personal data.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-PII-013: Indian Aadhaar (labelled; bare 12-digit too noisy). */
+export const ruleLogIndianAadhaar: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\b(aadhaar|aadhar|uidai)"?\s*[:=]\s*"?(\d{4}[ -]?\d{4}[ -]?\d{4})\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PII-009', 'Indian Aadhaar in log message',
+      'A labelled Aadhaar field appears in this log line.',
+      'UIDAI prohibits logging Aadhaar. Mask all but last 4.',
+      'HIGH', 'LOG_PII', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
 /** LOG-PII-009: US Social Security Number. */
 export const ruleLogUsSsn: LogRule = (line) => {
   const out: LogRuleMatch[] = [];
@@ -1225,6 +1279,9 @@ export const ALL_LOG_RULES: LogRule[] = [
   ruleLogPresignedUrl,
   ruleLogUsSsn,
   ruleLogPemPrivateKeyBody,
+  ruleLogUkNi,
+  ruleLogPakistaniCnic,
+  ruleLogIndianAadhaar,
 ];
 
 /** Run every rule against a single line. */

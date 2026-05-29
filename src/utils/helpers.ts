@@ -30,13 +30,16 @@ export class FileHelper {
     const ignoreMatcher = options.respectGitIgnore ? this.loadGitIgnoreMatcher(searchRoot) : null;
 
     try {
-      const files = fg.sync(['**/*.ts', '**/*.tsx'], {
+      // Scan every Node-runnable source extension. JS-only Express backends are still
+      // the majority of real-world deployments — restricting to `.ts`/`.tsx` made the
+      // scanner unusable against most boilerplates.
+      const files = fg.sync(['**/*.ts', '**/*.tsx', '**/*.js', '**/*.mjs', '**/*.cjs', '**/*.jsx'], {
         cwd: searchRoot,
         absolute: true,
         onlyFiles: true,
         unique: true,
         dot: false,
-        ignore: ['**/*.d.ts', '**/node_modules/**', ...(options.ignorePatterns ?? [])],
+        ignore: ['**/*.d.ts', '**/*.min.js', '**/node_modules/**', '**/dist/**', '**/build/**', '**/coverage/**', ...(options.ignorePatterns ?? [])],
       });
 
       return files

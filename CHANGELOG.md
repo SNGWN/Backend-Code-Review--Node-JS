@@ -4,6 +4,89 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-05-29
+
+### Added — Cross-file workflow
+- `ProjectContext` (`src/utils/projectContext.ts`) — multi-file pre-pass that
+  builds an import / re-export graph + per-exported-function summaries.
+  Lightweight: no TypeScript Compiler API, no per-project tsconfig discovery.
+- `buildReExportList` wired into the resolver — re-exports
+  (`export { exec } from 'child_process'`) are now traceable through
+  arbitrary-depth alias chains (HOP_LIMIT=16, circular-safe).
+- Two-pass analyzer: for directory scans, projectContext is built BEFORE
+  per-file detection, then injected into validation + SSRF detectors via
+  the factory signature. Single-file scans skip the pre-pass.
+- ValidationDetector: `getDangerousSink` falls back to
+  `ProjectContext.callResolvesToDangerousBuiltin` (catches re-exported
+  exec/spawn/etc.); `referencesTaintedInput` walks for cross-file
+  tainted-return helpers and direct-aliased tainted variables.
+- SsrfDetector: `getCallSinkName` consults project context first so
+  re-exported fs / outbound-HTTP APIs are caught at the call site.
+- Default-export + `export default function` source helpers handled
+  (closes F5).
+- Specific named re-export takes precedence over wildcard (closes a bug
+  where `export * from './a'; export { foo } from './b'` resolved `foo`
+  to `'./a'`).
+- Nested function bodies excluded from outer function's tainted-return
+  walk (no longer falsely flags `.map(x => req.body.x)` as tainting the
+  outer function).
+- Cross-file fixtures + tests (`tests/crossFileWorkflow.test.ts`):
+  F1 source helper, F3 re-export, F4 multi-hop alias chain, F5 default-export,
+  F6 JS-only project.
+
+### Added — Architecture
+- Iterative `ASTVisitor.visit` + `findNodes`. Closes the 4000-depth ternary
+  stack-overflow class identified by the architecture audit; same pre-order
+  semantics; depth now bounded by heap rather than stack.
+- `.js` / `.mjs` / `.cjs` / `.jsx` extension support in `FileHelper`. The
+  scanner previously globbed only `.ts` / `.tsx`, making it unusable on
+  the dominant JS Express boilerplate shape.
+- Removed `tests/fixtures/**/*.js` from `.gitignore` so JS fixtures are
+  committable.
+
+### Added — Authentication
+- `--bearer-token-stdin` flag + `KIBANA_BEARER_TOKEN` env for SSO
+  (Okta / PingFederate / OIDC) bearer-token auth.
+- `--api-key-stdin` flag for piping ES API key without writing to env.
+- `SIGTERM` handler alongside `SIGINT` in both log-review and search
+  modes (k8s / Docker graceful-shutdown).
+
+### Added — Log-rule coverage (+9 rules)
+- LOG-SEC-015 — HTTP Basic-auth header `Authorization: Basic <base64>`.
+- LOG-SEC-016 — Slack / Discord / MS-Teams incoming-webhook URLs.
+- LOG-SEC-017 — GitHub fine-grained PATs (`github_pat_…`), npm tokens
+  (`npm_…`), OpenAI keys, Heroku keys.
+- LOG-SEC-018 — AWS / GCP / Azure / Cloudflare presigned URLs (signature
+  query params).
+- LOG-PII-009 — US Social Security Number (area / group / serial sanity).
+- LOG-PII-010 (alias) — UK National Insurance Number.
+- LOG-PII-011 (alias) — Pakistani CNIC.
+- LOG-PII-012 (alias) — Indian Aadhaar (labelled).
+- LOG-SEC-019 — PEM private key body without header (label + `MII…`
+  base64 body, Shannon entropy ≥ 5.0).
+
+### Added — Output / compliance
+- `AnalysisReport.findingsByRule: Record<ruleId, count>` for PCI-DSS
+  Req 10 evidence.
+- SARIF `runs[0].properties.bcrStatistics` carries the same byRule /
+  byCategory / bySeverity histograms for DefectDojo / GitHub Code
+  Scanning ingest.
+- SARIF log-mode findings preserve `properties.logEvidence` (Kibana URL,
+  container, doc id, timestamp) and append the URL to `message.text` so
+  reviewers can click through from DefectDojo's findings list.
+- PCI-DSS-compliant excerpt masking: PAN-shaped runs use first-6 + last-4
+  (`424242******4242`) per Req 3.3 instead of the older 2+2 (`42**********42`).
+- Search-mode CLI banner masks the `--query` value so PAN / Emirates-ID
+  doesn't leak into stdout / CI capture.
+- Multi-container search: `--container payments-svc,onboarding-svc` emits
+  an ES `terms` filter, fanning out across services in a single scan.
+
+### Added — Operational hardening
+- KibanaClient: specific error messages for HTTP 404
+  `index_not_found_exception`, HTTP 401/403, and 200 OK with non-JSON
+  body (LB error pages). Body prefix scrubbed for credentials before
+  surfacing to the operator.
+
 ## [1.1.0] — 2026-05-29
 
 ### Added — Expanded log coverage

@@ -121,6 +121,18 @@ export class SarifReporter {
               endTimeUtc: report.timestamp,
             },
           ],
+          // Per-rule statistics surfaced as run-level properties so DefectDojo /
+          // GitHub code-scanning ingesters can use them as PCI-DSS Req 10 evidence
+          // without parsing every individual result.
+          properties: {
+            'bcrStatistics': {
+              filesAnalyzed: report.filesAnalyzed,
+              totalFindings: report.totalFindings,
+              byRule: report.findingsByRule,
+              byCategory: report.findingsByCategory,
+              bySeverity: report.findingsBySeverity,
+            },
+          },
           results,
           columnKind: 'utf16CodeUnits',
         },
@@ -214,8 +226,30 @@ export class SarifReporter {
         cwe: finding.cwe ?? rule?.cwe ?? [],
         owasp: finding.owasp ?? rule?.owasp,
         recommendation: finding.recommendation,
+        // Log-mode findings carry their Kibana deep-link + container + timestamp here
+        // so DefectDojo / GitHub Code Scanning surface a clickable evidence link.
+        ...(finding.logEvidence
+          ? {
+              logEvidence: {
+                docId: finding.logEvidence.docId,
+                index: finding.logEvidence.index,
+                timestamp: finding.logEvidence.timestamp,
+                container: finding.logEvidence.container,
+                kibanaUrl: finding.logEvidence.kibanaUrl,
+              },
+            }
+          : {}),
       },
     };
+
+    // For log-mode findings, append the Kibana URL to the human message so reviewers
+    // can click through from DefectDojo / GitHub Code Scanning UIs that surface
+    // `message.text` but not arbitrary properties.
+    if (finding.logEvidence?.kibanaUrl) {
+      result.message = {
+        text: `${finding.title}: ${finding.description}\n\nKibana: ${finding.logEvidence.kibanaUrl}\nDoc: ${finding.logEvidence.index}/${finding.logEvidence.docId}`,
+      };
+    }
 
     if (finding.suppressed) {
       result.suppressions = [

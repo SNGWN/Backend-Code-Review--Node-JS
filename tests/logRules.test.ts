@@ -170,13 +170,22 @@ describe('DB connection error rule (LOG-OPS-001)', () => {
 });
 
 describe('Redacted excerpt', () => {
-  test('masks the matched substring while preserving context', () => {
+  test('masks the matched substring while preserving context (PCI first-6-last-4 for PAN-shaped digits)', () => {
     const line = 'customer payment failed for card 4242424242424242 amount 100';
     const idx = line.indexOf('4242424242424242');
     const excerpt = buildRedactedExcerpt(line, idx, idx + 16);
+    // PCI-DSS Req 3.3 — first 6 + last 4 may be retained. Middle 6 chars are masked.
     expect(excerpt).not.toContain('4242424242424242');
-    expect(excerpt).toContain('42');
-    expect(excerpt.match(/\*+/)?.[0].length).toBe(12);
+    expect(excerpt).toContain('424242'); // BIN
+    expect(excerpt).toContain('4242'); // last 4
+    expect(excerpt.match(/\*+/)?.[0].length).toBe(6);
+  });
+  test('non-PAN matches keep the older first-2-last-2 mask', () => {
+    const line = 'user=alice@bank.ae signed in';
+    const idx = line.indexOf('alice@bank.ae');
+    const excerpt = buildRedactedExcerpt(line, idx, idx + 13);
+    expect(excerpt).not.toContain('alice@bank.ae');
+    expect(excerpt).toMatch(/al\*+ae/);
   });
 });
 

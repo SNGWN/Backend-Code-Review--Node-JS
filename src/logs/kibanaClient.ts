@@ -40,6 +40,11 @@ export interface KibanaClientConfig {
   password?: string;
   apiKeyId?: string;
   apiKey?: string;
+  /**
+   * SSO bearer token (Okta, PingFederate, Cognito, OIDC). Mutually exclusive with
+   * Basic + ApiKey auth.
+   */
+  bearerToken?: string;
   transport: KibanaTransport;
   /** Index pattern to search (e.g. `filebeat-*`, `logstash-*`). */
   index: string;
@@ -148,14 +153,16 @@ export class KibanaClient {
     this.abortSignal = config.abortSignal;
 
     // Build the auth header once; never store password as a property after this point.
-    if (config.apiKeyId && config.apiKey) {
+    if (config.bearerToken) {
+      this.authHeader = `Bearer ${config.bearerToken}`;
+    } else if (config.apiKeyId && config.apiKey) {
       const encoded = Buffer.from(`${config.apiKeyId}:${config.apiKey}`, 'utf-8').toString('base64');
       this.authHeader = `ApiKey ${encoded}`;
     } else if (config.username && config.password) {
       const credential = `${config.username}:${config.password}`;
       this.authHeader = `Basic ${Buffer.from(credential, 'utf-8').toString('base64')}`;
     } else {
-      throw new Error('KibanaClient requires either (username + password) or (apiKeyId + apiKey)');
+      throw new Error('KibanaClient requires (username + password) OR (apiKeyId + apiKey) OR bearerToken');
     }
 
     this.httpAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
@@ -300,11 +307,8 @@ export class KibanaClient {
                 },
               },
             },
-            {
-              term: {
-                [`${this.containerField}.keyword`]: options.containerName,
-              },
-            },
+            // Support comma-separated container lists for multi-service compliance scans.
+            ...this.buildContainerFilters(options.containerName),
           ],
         },
       },
@@ -324,9 +328,13 @@ export class KibanaClient {
       },
     ];
     if (options.containerName) {
-      filter.push({
-        term: { [`${this.containerField}.keyword`]: options.containerName },
-      });
+      // Comma-separated list → `terms` (multi-container fan-out). Single value → `term`.
+      const containers = options.containerName.split(',').map((s) => s.trim()).filter(Boolean);
+      if (containers.length > 1) {
+        filter.push({ terms: { [`${this.containerField}.keyword`]: containers } });
+      } else {
+        filter.push({ term: { [`${this.containerField}.keyword`]: containers[0] } });
+      }
     }
 
     const body: Record<string, unknown> = {
@@ -354,6 +362,15 @@ export class KibanaClient {
     };
     if (searchAfter) body.search_after = searchAfter;
     return body;
+  }
+
+  private buildContainerFilters(containerName: string): unknown[] {
+    const containers = containerName.split(',').map((s) => s.trim()).filter(Boolean);
+    if (containers.length === 0) return [];
+    if (containers.length === 1) {
+      return [{ term: { [`${this.containerField}.keyword`]: containers[0] } }];
+    }
+    return [{ terms: { [`${this.containerField}.keyword`]: containers } }];
   }
 
   private async search(body: Record<string, unknown>): Promise<{ hits?: { hits?: unknown[] } }> {

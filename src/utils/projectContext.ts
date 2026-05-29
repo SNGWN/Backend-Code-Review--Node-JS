@@ -162,9 +162,12 @@ export class ProjectContext {
       }
 
       // 2. Check if the target file re-exports the name through another module.
-      const reExport = targetSummary.reExports.find(
-        (r) => r.exportedName === currentName || r.exportedName === '*'
-      );
+      // Prefer a specific (named) re-export over a wildcard so that
+      // `export { foo } from './b'; export * from './a';` correctly resolves
+      // `foo` against `'./b'`, not `'./a'`.
+      const reExport =
+        targetSummary.reExports.find((r) => r.exportedName === currentName) ??
+        targetSummary.reExports.find((r) => r.exportedName === '*');
       if (reExport) {
         const nextName = reExport.exportedName === '*' ? currentName : reExport.upstreamName;
         currentModule = reExport.fromModule;
@@ -273,10 +276,23 @@ export class ProjectContext {
   ): void {
     for (const statement of sourceFile.statements) {
       // `export function foo(req) { … }`
-      if (ts.isFunctionDeclaration(statement) && this.isExported(statement) && statement.name) {
-        const name = statement.name.text;
+      if (ts.isFunctionDeclaration(statement) && this.isExported(statement)) {
+        const name = statement.name?.text;
         const summary = this.summarizeFunctionBody(statement);
-        summaries.set(name, summary);
+        if (name) summaries.set(name, summary);
+        // `export default function (req) { … }` — register under 'default'.
+        const mods = ts.canHaveModifiers(statement) ? (ts.getModifiers(statement) ?? []) : [];
+        if (mods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) {
+          summaries.set('default', summary);
+        }
+        continue;
+      }
+      // `export default …` — bare expression form.
+      if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
+        const expr = statement.expression;
+        if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
+          summaries.set('default', this.summarizeFunctionBody(expr));
+        }
         continue;
       }
       // `export const foo = (req) => …` / `export const foo = function (req) { … }`
@@ -320,16 +336,30 @@ export class ProjectContext {
     let passesParamToSink = false;
 
     if (node.body) {
-      // Walk return statements; if their expression contains an untrusted text marker,
-      // the function leaks request data into its return.
-      ASTVisitor.findNodes(node.body, (n) => ts.isReturnStatement(n)).forEach((ret) => {
-        const expr = (ret as ts.ReturnStatement).expression;
-        if (!expr) return;
+      // Walk return statements ONLY for this function's body, not nested function bodies.
+      // Previously a `return req.body.x` inside an inner `.map(x => req.body.x)` would
+      // falsely mark the OUTER function as returning tainted data.
+      const directReturns: ts.ReturnStatement[] = [];
+      const collectReturns = (n: ts.Node): void => {
+        if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
+            ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) {
+          // Don't descend into nested function bodies — their returns belong to that
+          // function, not this one.
+          return;
+        }
+        if (ts.isReturnStatement(n)) directReturns.push(n);
+        n.forEachChild(collectReturns);
+      };
+      node.body.forEachChild(collectReturns);
+      for (const ret of directReturns) {
+        const expr = ret.expression;
+        if (!expr) continue;
         const text = expr.getText(node.getSourceFile());
         if (isUntrustedInputText(text)) {
           returnsTaintedFromRequest = true;
+          break;
         }
-      });
+      }
 
       // Walk dangerous-sink call expressions where any param of the function flows in.
       const paramNames = new Set<string>();

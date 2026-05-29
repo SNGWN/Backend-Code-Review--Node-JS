@@ -49,4 +49,20 @@ describe('Cross-file workflow', () => {
     expect(ctx).not.toBeNull();
     expect(ctx?.size).toBeGreaterThanOrEqual(2);
   });
+
+  test('F5: default-exported source helper taints downstream SQL sink', () => {
+    const report = new BackendCodeReviewAnalyzer().analyze(fixture('f5-default-export'));
+    const sqli = report.findings.find((f) => f.ruleId === 'BCR-VAL-001');
+    expect(sqli).toBeDefined();
+    expect(sqli?.file).toContain('b.ts');
+  });
+
+  test('F6: JS-only project (no TS files) — scanner still walks and re-exports resolve', () => {
+    const report = new BackendCodeReviewAnalyzer().analyze(fixture('f6-js-only'));
+    expect(report.filesAnalyzed).toBeGreaterThan(0);
+    // CJS re-export shape: `module.exports = { exec: require('child_process').exec }`.
+    // Resolved at the consumer via the require-destructure alias map.
+    const cmd = report.findings.find((f) => f.ruleId === 'BCR-VAL-002');
+    expect(cmd).toBeDefined();
+  });
 });
