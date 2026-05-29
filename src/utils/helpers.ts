@@ -154,15 +154,19 @@ export class StringHelper {
    * // Returns: ['password', 'secret']
    */
   static containsSensitivePatterns(str: string): string[] {
+    // Tightened patterns: word boundaries on otherwise high-collision tokens
+    // ("cc" used to fire inside "successfully", "cert" inside "uncertain"), and PII-name
+    // patterns (email/userId/userName) removed because they trigger on every safe
+    // structured log. Real PII risk in logs is better handled by a separate audit-log
+    // rule that doesn't have logged-name collisions as its trigger.
     const patterns = [
-      /password|pwd|passwd/gi,
-      /api[_-]?key|apikey|secret/gi,
-      /token|access[_-]token|refresh[_-]token/gi,
-      /bearer\s+[\w\-\.]+/gi,
-      /authorization|auth\s*:/gi,
-      /credit[_-]?card|cc|ssn|social[_-]security/gi,
-      /email|user[_-]?id|user[_-]?name/gi,
-      /private[_-]?key|public[_-]?key|cert/gi,
+      /\bpassword\b|\bpwd\b|\bpasswd\b/gi,
+      /\bapi[_-]?key\b|\bapikey\b|\bsecret\b/gi,
+      /\btoken\b|\baccess[_-]?token\b|\brefresh[_-]?token\b/gi,
+      /\bbearer\s+[\w\-\.]+\b/gi,
+      /\bauthorization\b|\bauth\s*:/gi,
+      /\bcredit[_-]?card\b|\bccnum\b|\bccnumber\b|\bssn\b|\bsocial[_-]?security\b/gi,
+      /\bprivate[_-]?key\b|\bcertificate\b/gi,
     ];
 
     const matches: string[] = [];
@@ -189,9 +193,13 @@ export class StringHelper {
    * StringHelper.isValidationLibraryCall('parseInt()');    // false
    */
   static isValidationLibraryCall(functionName: string): boolean {
-    return VALIDATION_LIBRARIES.some((lib) =>
-      functionName.toLowerCase().includes(lib)
-    );
+    // Use word boundaries — substring matches would fire on `path.join` (`joi`),
+    // `cleanup` (`yup`), `lazod` (`zod`), etc.
+    const lower = functionName.toLowerCase();
+    return VALIDATION_LIBRARIES.some((lib) => {
+      const pattern = new RegExp(`\\b${lib}\\b`);
+      return pattern.test(lower);
+    });
   }
 
   /**

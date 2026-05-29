@@ -2,7 +2,50 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
-import { StringHelper } from '../utils/helpers';
+/**
+ * Best-effort heuristic for "this string looks like an actual secret, not a placeholder."
+ * Rejects: short values, all-lowercase words, obvious sentinels ("changeme", "your-secret-here").
+ * Accepts: hex (16+), base64-ish (16+ with mixed-case/digits), high-entropy mixed-class.
+ */
+function looksLikeRealSecret(value: string): boolean {
+  if (!value || value.length < 8) return false;
+
+  // Sentinels and obvious placeholders.
+  if (/^(changeme|your[_-]?(secret|key|token)|placeholder|example|sample|test|todo|fix(me)?)([_-].*)?$/i.test(value)) {
+    return false;
+  }
+
+  // Kebab/snake words ("my-cool-key", "session-id-header") — no digits, just labels.
+  if (/^[a-z]+(?:[-_][a-z]+)*$/i.test(value) && !/\d/.test(value)) return false;
+
+  // HTTP header / Content-Type / event-name shapes — capitalised words with hyphens, no digits.
+  if (/^[A-Z][A-Za-z0-9]*(?:[-_][A-Z][A-Za-z0-9]*)+$/.test(value) && !/\d/.test(value)) return false;
+
+  // Common service-name shapes ("auth-token", "api-key", "x-request-id").
+  if (/^[xX]-[A-Za-z][A-Za-z0-9-]*$/.test(value)) return false;
+
+  // High-entropy positive signals.
+  if (/^[A-Fa-f0-9]{16,}$/.test(value)) return true;
+  if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(value)) return true;
+
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[._+=/-]/].filter((pattern) => pattern.test(value)).length;
+  // Require digits OR length>=20 for the mixed-class branch — "X-Secret-Header"-style
+  // labels never hit this anymore.
+  return classes >= 3 && value.length >= 12 && (/\d/.test(value) || value.length >= 20);
+}
+
+/**
+ * A password container can hold short, low-entropy strings ("admin123") that are still
+ * exploitable. We accept anything non-trivial and reject only sentinels / single tokens
+ * that look like placeholders.
+ */
+function looksLikeHardcodedPassword(value: string): boolean {
+  if (!value || value.length < 4) return false;
+  if (/^(changeme|placeholder|example|sample|todo|none|null|undefined|password)$/i.test(value)) {
+    return false;
+  }
+  return true;
+}
 import { HardcodedSecretPocGenerator } from '../poc/templates/HardcodedSecretPocGenerator';
 import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept, PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
@@ -106,6 +149,7 @@ export class AuthenticationDetector {
       if (!hasVerification) {
         const { line, column } = this.parser.getLineAndColumn(access.getStart());
         this.findings.push({
+          ruleId: 'BCR-AUTH-001',
           category: 'AUTHENTICATION',
           severity: 'CRITICAL',
           title: 'Unverified Token Usage',
@@ -164,6 +208,7 @@ export class AuthenticationDetector {
 
       if (hasSuspiciousKeywords && isLikelyRealSecret && this.isInAssignmentContext(node)) {
         this.findings.push({
+          ruleId: 'BCR-AUTH-002',
           category: 'AUTHENTICATION',
           severity: 'CRITICAL',
           title: 'Hardcoded Secret/Token',
@@ -225,6 +270,7 @@ export class AuthenticationDetector {
       }
 
       this.findings.push({
+        ruleId: 'BCR-AUTH-003',
         category: 'AUTHENTICATION',
         severity: 'HIGH',
         title: 'Sensitive Function Without Auth Guard',
@@ -239,43 +285,60 @@ export class AuthenticationDetector {
   }
 
   private detectHardcodedSecrets(): void {
+    // Skip test files. `const password = 'password1'` is a routine Jest spec, not a
+    // hardcoded production secret. Real cred-leak shapes (`process.env.FOO = 'sk_live…'`)
+    // are still caught elsewhere — this rule's signal-to-noise is too low in test files.
+    // Filename-only check (don't match fixtures-under-tests/ paths).
+    if (/\.(test|spec)\.tsx?$|\/__tests__\//.test(this.filePath.toLowerCase())) {
+      return;
+    }
     const varDeclarations = ASTVisitor.findVariableDeclarations(this.sourceFile);
+    // Stricter than StringHelper.containsSensitivePatterns: we deliberately exclude
+    // benign identifier names ("email", "username", "userId") that fire on every login
+    // form without indicating a hardcoded secret. The variable name must read like a
+    // *credential* container, not just any PII.
+    const credentialNamePattern = /(secret|password|passwd|pwd|token|apikey|api[_-]key|access[_-]?token|refresh[_-]?token|private[_-]?key|client[_-]?secret|jwt[_-]?secret|encryption[_-]?key|signing[_-]?key|cipher[_-]?key)/i;
 
     varDeclarations.forEach((decl) => {
       const varName = ASTVisitor.getIdentifierName(decl.name);
+      if (!varName || !credentialNamePattern.test(varName)) return;
+      if (!decl.initializer || !ts.isStringLiteral(decl.initializer)) return;
 
-      if (varName && StringHelper.containsSensitivePatterns(varName).length > 0) {
-        if (decl.initializer && ts.isStringLiteral(decl.initializer)) {
-          if (
-            isStringLiteralInMetadataContext(decl.initializer) ||
-            isEnumLikeLiteral(decl.initializer.text) ||
-            isPathLikeLiteral(decl.initializer.text)
-          ) {
-            return;
-          }
-
-          const { line, column } = this.parser.getLineAndColumn(decl.getStart());
-          const code = decl.getText();
-
-          // Create finding
-          const finding: Finding = {
-            category: 'AUTHENTICATION',
-            severity: 'CRITICAL',
-            title: 'Hardcoded Secret in Variable',
-            description: `Variable '${varName}' contains a hardcoded secret or sensitive value.`,
-            file: this.filePath,
-            line,
-            column,
-            code,
-            recommendation: 'Use environment variables or secure configuration management instead.',
-          };
-          
-          this.findings.push(finding);
-
-          // Generate POC for this finding
-          this.generateSecretPoc(finding, code, line);
-        }
+      const value = decl.initializer.text;
+      if (
+        isStringLiteralInMetadataContext(decl.initializer) ||
+        isEnumLikeLiteral(value) ||
+        isPathLikeLiteral(value)
+      ) {
+        return;
       }
+
+      // Password containers get a looser test: real passwords can be short and
+      // single-class. Other credential names still need the full entropy/format check.
+      const isPasswordContainer = /(password|passwd|pwd)/i.test(varName);
+      const passes = isPasswordContainer
+        ? looksLikeHardcodedPassword(value)
+        : looksLikeRealSecret(value);
+
+      if (!passes) return;
+
+      const { line, column } = this.parser.getLineAndColumn(decl.getStart());
+      const code = decl.getText();
+      const finding: Finding = {
+        ruleId: 'BCR-AUTH-004',
+        category: 'AUTHENTICATION',
+        severity: 'CRITICAL',
+        title: 'Hardcoded Secret in Variable',
+        description: `Variable '${varName}' contains a hardcoded secret or sensitive value.`,
+        file: this.filePath,
+        line,
+        column,
+        code,
+        recommendation: 'Use environment variables or secure configuration management instead.',
+      };
+
+      this.findings.push(finding);
+      this.generateSecretPoc(finding, code, line);
     });
   }
 

@@ -1,19 +1,110 @@
+import * as fs from 'fs';
 import * as path from 'path';
-import { BackendCodeReviewAnalyzer } from './analyzer';
+import { BackendCodeReviewAnalyzer, ExtendedAnalysisReport } from './analyzer';
 import { JSONReporter } from './reporter';
+import { SarifReporter } from './reporter/sarif';
+import { Baseline } from './rules/baseline';
+import { listRules, severityAtLeast } from './rules/registry';
+import { Severity } from './types';
 import { Logger } from './utils/logger';
+import { KibanaClient, KibanaTransport } from './logs/kibanaClient';
+import { LogReviewAnalyzer } from './logs/logReviewAnalyzer';
 
 const yargs = require('yargs/yargs') as (args?: readonly string[]) => import('yargs').Argv;
 const { hideBin } = require('yargs/helpers') as typeof import('yargs/helpers');
 
+type OutputFormat = 'json' | 'text' | 'sarif';
+type RunMode = 'code' | 'logs';
+
+const VALID_FORMATS: OutputFormat[] = ['json', 'text', 'sarif'];
+const VALID_SEVERITIES: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
+const VALID_MODES: RunMode[] = ['code', 'logs'];
+const VALID_TRANSPORTS: KibanaTransport[] = ['kibana-proxy', 'direct'];
+
+class CliUsageError extends Error {}
+
+function parseFormat(value: unknown): OutputFormat {
+  const normalized = String(value || 'json').toLowerCase();
+  if (!(VALID_FORMATS as string[]).includes(normalized)) {
+    throw new CliUsageError(`--format must be one of ${VALID_FORMATS.join(', ')} (got '${value}')`);
+  }
+  return normalized as OutputFormat;
+}
+
+function parseSeverityStrict(flagName: string, value: unknown, fallback?: Severity): Severity | undefined {
+  if (value === undefined || value === null || value === '') return fallback;
+  const normalized = String(value).toUpperCase();
+  if (!(VALID_SEVERITIES as string[]).includes(normalized)) {
+    throw new CliUsageError(`--${flagName} must be one of ${VALID_SEVERITIES.join(', ')} (got '${value}')`);
+  }
+  return normalized as Severity;
+}
+
 export async function runCli(args = hideBin(process.argv)): Promise<number> {
   try {
     const argv = await yargs(args)
+      .option('mode', {
+        alias: 'm',
+        describe: `Review mode: 'code' (static SAST, default) or 'logs' (Kibana / Elasticsearch log review)`,
+        type: 'string',
+        default: 'code',
+      })
       .option('path', {
         alias: 'p',
-        describe: 'Path to analyze (file or directory)',
+        describe: 'Path to analyze (file or directory) — code mode only',
         type: 'string',
         default: '.',
+      })
+      // ── Log review options (mode=logs) ──────────────────────────────────
+      .option('kibana-url', {
+        describe: 'Base URL of Kibana (or ES) — log review only. Env: KIBANA_URL',
+        type: 'string',
+      })
+      .option('elasticsearch-url', {
+        describe: 'Alias of --kibana-url for direct ES transport. Env: ELASTICSEARCH_URL',
+        type: 'string',
+      })
+      .option('username', {
+        alias: 'u',
+        describe: 'Kibana / ES username. Env: KIBANA_USERNAME',
+        type: 'string',
+      })
+      .option('password-stdin', {
+        describe: 'Read Kibana / ES password from stdin (recommended). Otherwise set KIBANA_PASSWORD.',
+        type: 'boolean',
+        default: false,
+      })
+      .option('container', {
+        describe: 'Container name to filter (e.g. payments-svc). Env: CONTAINER_NAME',
+        type: 'string',
+      })
+      .option('container-field', {
+        describe: 'ES field carrying the container name. Default: kubernetes.container.name',
+        type: 'string',
+      })
+      .option('log-index', {
+        describe: 'Elasticsearch index pattern (e.g. filebeat-*). Env: LOG_INDEX',
+        type: 'string',
+      })
+      .option('days', {
+        describe: 'How many days back to scan (default: 15). Env: LOG_REVIEW_DAYS',
+        type: 'number',
+        default: 15,
+      })
+      .option('transport', {
+        describe: `ES access transport: ${VALID_TRANSPORTS.join(', ')} (default: kibana-proxy).`,
+        type: 'string',
+        default: 'kibana-proxy',
+      })
+      .option('max-hits', {
+        describe: 'Maximum log hits to scan per run (safety cap, default 50000).',
+        type: 'number',
+        default: 50_000,
+      })
+      .option('insecure', {
+        describe: 'Skip TLS certificate verification for private-CA Kibana clusters.',
+        type: 'boolean',
+        default: false,
       })
       .option('output', {
         alias: 'o',
@@ -22,13 +113,45 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
       })
       .option('format', {
         alias: 'f',
-        describe: 'Output format (json, text)',
+        describe: `Output format (${VALID_FORMATS.join(', ')})`,
         type: 'string',
         default: 'json',
       })
       .option('include-heuristics', {
         alias: 'a',
         describe: 'Include lower-confidence heuristic findings in the report',
+        type: 'boolean',
+        default: false,
+      })
+      .option('min-severity', {
+        describe: `Drop findings below this severity (${VALID_SEVERITIES.join(', ')})`,
+        type: 'string',
+      })
+      .option('fail-on', {
+        describe: `Exit non-zero only when findings of at least this severity remain (${VALID_SEVERITIES.join(', ')})`,
+        type: 'string',
+        default: 'HIGH',
+      })
+      .option('baseline', {
+        describe: 'Path to a baseline JSON file. Findings present in the baseline are suppressed.',
+        type: 'string',
+      })
+      .option('update-baseline', {
+        describe: 'Write the current findings to the baseline file path and exit without failure semantics.',
+        type: 'boolean',
+        default: false,
+      })
+      .option('disable-rule', {
+        describe: 'Rule ID(s) to disable. Can be passed multiple times or as a comma-separated list.',
+        type: 'array',
+      })
+      .option('show-suppressed', {
+        describe: 'Include suppressed findings (baseline / inline) in SARIF output for reviewer visibility.',
+        type: 'boolean',
+        default: false,
+      })
+      .option('list-rules', {
+        describe: 'Print the rule catalog (id, severity, CWE, OWASP) and exit.',
         type: 'boolean',
         default: false,
       })
@@ -52,12 +175,18 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
         type: 'boolean',
         default: true,
       })
+      .example('$0 --path ./src --format sarif --output report.sarif', 'Emit SARIF for GitHub code scanning')
+      .example('$0 --path ./src --min-severity HIGH --fail-on HIGH', 'CI gate on HIGH+ findings only')
+      .example('$0 --update-baseline --baseline .security-baseline.json --path ./src', 'Snapshot baseline')
+      .example('$0 --baseline .security-baseline.json --path ./src', 'Subsequent scans suppress baselined findings')
+      .example('$0 --list-rules | jq .', 'Inspect the rule catalog')
       .help()
       .alias('help', 'h')
       .version()
+      // Reject unknown flags; previously yargs accepted anything and silently exited 0.
+      .strict()
       .argv;
 
-    const targetPath = path.resolve(argv.path as string);
     const logFormat = String(argv['log-format'] || 'text').toLowerCase() === 'json' ? 'json' : 'text';
 
     Logger.configure({
@@ -66,28 +195,66 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
       format: logFormat,
     });
 
-    Logger.info(`
+    if (argv['list-rules']) {
+      printRuleCatalog();
+      return 0;
+    }
+
+    const mode = parseMode(argv.mode);
+    const includeHeuristics = Boolean(argv['include-heuristics']);
+    const minSeverity = parseSeverityStrict('min-severity', argv['min-severity']);
+    const disabledRules = parseStringList(argv['disable-rule']);
+
+    let report: ExtendedAnalysisReport;
+    let getBaselineFindings: () => Parameters<typeof Baseline.write>[1];
+
+    if (mode === 'logs') {
+      const logResult = await runLogReview(argv, { includeHeuristics, minSeverity, disabledRules });
+      if (typeof logResult === 'number') return logResult;
+      report = logResult.report;
+      getBaselineFindings = logResult.getBaselineFindings;
+    } else {
+      const targetPath = path.resolve(argv.path as string);
+
+      Logger.info(`
 ╔═════════════════════════════════════════════╗
 ║   Backend Code Review - Node.js Analyzer    ║
 ╚═════════════════════════════════════════════╝
 `);
-    Logger.info(`📊 Analyzing: ${targetPath}\n`);
+      Logger.info(`📊 Analyzing: ${targetPath}\n`);
 
-    const analyzer = new BackendCodeReviewAnalyzer();
-    const includeHeuristics = Boolean(argv['include-heuristics']);
-    const report = analyzer.analyze(targetPath, { includeHeuristics });
+      const analyzer = new BackendCodeReviewAnalyzer();
+      report = analyzer.analyze(targetPath, {
+        includeHeuristics,
+        minSeverity,
+        baselinePath: argv['update-baseline'] ? undefined : (argv.baseline as string | undefined),
+        disabledRules,
+        showSuppressed: Boolean(argv['show-suppressed']),
+      });
+      getBaselineFindings = () => analyzer.getAllFindingsWithFingerprints();
+    }
 
-    const format = String(argv.format || 'json').toLowerCase();
+    // Update-baseline mode: write the current finding set to the baseline and exit 0.
+    if (argv['update-baseline']) {
+      const baselinePath = (argv.baseline as string | undefined) ?? '.security-baseline.json';
+      try {
+        Baseline.write(baselinePath, getBaselineFindings());
+        Logger.success(`Baseline written to ${baselinePath}`);
+        return 0;
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        Logger.error('Failed to write baseline', { error: errorMessage, baselinePath });
+        return 1;
+      }
+    }
+
+    const format = parseFormat(argv.format);
     const outputPath =
       (argv.output as string) ||
-      `code-review-${Date.now()}.${format === 'text' ? 'txt' : 'json'}`;
+      `code-review-${Date.now()}.${format === 'text' ? 'txt' : format === 'sarif' ? 'sarif' : 'json'}`;
 
     try {
-      if (format === 'text') {
-        JSONReporter.writeTextReport(report, outputPath);
-      } else {
-        JSONReporter.writeReport(report, outputPath);
-      }
+      writeReport(report, format, outputPath, Boolean(argv['show-suppressed']));
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       Logger.error('Failed to write output report', { error: errorMessage, outputPath });
@@ -96,7 +263,12 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
 
     JSONReporter.printSummary(report);
 
-    if (report.totalFindings > 0) {
+    const failOn = parseSeverityStrict('fail-on', argv['fail-on'], 'HIGH') ?? 'HIGH';
+    const hasFailingFinding = report.findings.some((finding) =>
+      severityAtLeast(finding.severity, failOn)
+    );
+
+    if (hasFailingFinding) {
       return 1;
     }
     if (report.hasRuntimeErrors && Boolean(argv['fail-on-runtime-errors'])) {
@@ -105,10 +277,230 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
 
     return 0;
   } catch (error) {
+    if (error instanceof CliUsageError) {
+      Logger.error(error.message);
+      return 2;
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
     Logger.error('Fatal error', { error: errorMessage });
     return 1;
   }
+}
+
+function parseMode(value: unknown): RunMode {
+  const normalized = String(value || 'code').toLowerCase();
+  if (!(VALID_MODES as string[]).includes(normalized)) {
+    throw new CliUsageError(`--mode must be one of ${VALID_MODES.join(', ')} (got '${value}')`);
+  }
+  return normalized as RunMode;
+}
+
+function parseTransport(value: unknown): KibanaTransport {
+  const normalized = String(value || 'kibana-proxy').toLowerCase();
+  if (!(VALID_TRANSPORTS as string[]).includes(normalized)) {
+    throw new CliUsageError(`--transport must be one of ${VALID_TRANSPORTS.join(', ')} (got '${value}')`);
+  }
+  return normalized as KibanaTransport;
+}
+
+function envOrFlag(flagValue: unknown, envName: string): string | undefined {
+  const flag = typeof flagValue === 'string' ? flagValue.trim() : undefined;
+  if (flag) return flag;
+  const env = process.env[envName];
+  if (env && env.trim()) return env.trim();
+  return undefined;
+}
+
+function readPasswordFromStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on('data', (chunk: Buffer) => chunks.push(chunk));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8').replace(/\r?\n$/, '')));
+    process.stdin.on('error', reject);
+  });
+}
+
+interface LogReviewExecResult {
+  report: ExtendedAnalysisReport;
+  getBaselineFindings: () => Parameters<typeof Baseline.write>[1];
+}
+
+async function runLogReview(
+  argv: Record<string, unknown>,
+  shared: { includeHeuristics: boolean; minSeverity: Severity | undefined; disabledRules: string[] | undefined }
+): Promise<LogReviewExecResult | number> {
+  // Resolve every credential / endpoint with env-var fallback. UAE bank policy: secrets
+  // never on the command line — env vars or stdin only.
+  const kibanaUrl = envOrFlag(argv['kibana-url'], 'KIBANA_URL') ?? envOrFlag(argv['elasticsearch-url'], 'ELASTICSEARCH_URL');
+  const username = envOrFlag(argv.username, 'KIBANA_USERNAME');
+  const container = envOrFlag(argv.container, 'CONTAINER_NAME');
+  const containerField = envOrFlag(argv['container-field'], 'CONTAINER_FIELD') ?? 'kubernetes.container.name';
+  const logIndex = envOrFlag(argv['log-index'], 'LOG_INDEX') ?? 'filebeat-*';
+  const days = Number(argv.days ?? process.env.LOG_REVIEW_DAYS ?? 15);
+  const transport = parseTransport(argv.transport);
+  const maxHits = Number(argv['max-hits'] ?? 50_000);
+  const insecure = Boolean(argv.insecure);
+
+  let password: string | undefined;
+  let apiKeyId: string | undefined;
+  let apiKey: string | undefined;
+
+  if (process.env.KIBANA_API_KEY_ID && process.env.KIBANA_API_KEY) {
+    apiKeyId = process.env.KIBANA_API_KEY_ID;
+    apiKey = process.env.KIBANA_API_KEY;
+  } else if (argv['password-stdin']) {
+    if (process.stdin.isTTY) {
+      throw new CliUsageError('--password-stdin requires stdin to be piped (e.g. `echo $PWD | bcr --password-stdin ...`). Detected a TTY.');
+    }
+    password = await readPasswordFromStdin();
+  } else if (process.env.KIBANA_PASSWORD) {
+    password = process.env.KIBANA_PASSWORD;
+  }
+
+  const missing: string[] = [];
+  if (!kibanaUrl) missing.push('--kibana-url / KIBANA_URL');
+  if (!container) missing.push('--container / CONTAINER_NAME');
+  // Auth: either API-key pair OR username + password.
+  const hasApiKey = !!apiKeyId && !!apiKey;
+  if (!hasApiKey) {
+    if (!username) missing.push('--username / KIBANA_USERNAME (or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
+    if (!password) missing.push('KIBANA_PASSWORD env var (or --password-stdin, or KIBANA_API_KEY_ID + KIBANA_API_KEY)');
+  }
+  if (missing.length > 0) {
+    throw new CliUsageError(`Log review missing required inputs:\n  - ${missing.join('\n  - ')}`);
+  }
+  if (!Number.isFinite(days) || days <= 0 || days > 365) {
+    throw new CliUsageError(`--days must be a positive number ≤ 365 (got ${argv.days})`);
+  }
+
+  Logger.info(`
+╔═════════════════════════════════════════════╗
+║   Backend Code Review - Log Review Mode     ║
+╚═════════════════════════════════════════════╝
+`);
+  Logger.info(`📡 Kibana: ${kibanaUrl}  (transport: ${transport})`);
+  Logger.info(`🪵  Container: ${container}  on index ${logIndex}`);
+  Logger.info(`⏱  Window: last ${days} days\n`);
+
+  if (insecure) {
+    Logger.warn('TLS certificate verification disabled (--insecure). Use only with trusted private CAs.');
+  }
+
+  // SIGINT → graceful abort: flush whatever findings we already have.
+  const abortController = new AbortController();
+  const onSigint = () => {
+    Logger.warn('\nReceived SIGINT, finishing in-flight requests and flushing findings…');
+    abortController.abort();
+  };
+  process.on('SIGINT', onSigint);
+
+  const client = new KibanaClient({
+    baseUrl: kibanaUrl as string,
+    username,
+    password,
+    apiKeyId,
+    apiKey,
+    transport,
+    index: logIndex,
+    containerField,
+    rejectUnauthorized: !insecure,
+    abortSignal: abortController.signal,
+    onProgress: (hits) => {
+      Logger.info(`  scanned ${hits.toLocaleString()} log entries…`);
+    },
+  });
+
+  // Fail fast on bad creds before running a 50k-hit scan.
+  try {
+    const ping = await client.ping();
+    if (!ping.ok) {
+      throw new CliUsageError(`Kibana/ES auth failed: HTTP ${ping.status}. Body: ${ping.body.slice(0, 200)}`);
+    }
+  } catch (error) {
+    if (error instanceof CliUsageError) throw error;
+    throw new CliUsageError(`Could not reach Kibana/ES at ${kibanaUrl}: ${(error as Error).message}`);
+  }
+
+  const now = new Date();
+  const fromIso = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+  const toIso = now.toISOString();
+
+  const analyzer = new LogReviewAnalyzer(client);
+  try {
+    const report = await analyzer.analyze({
+      containerName: container as string,
+      fromIso,
+      toIso,
+      includeHeuristics: shared.includeHeuristics,
+      minSeverity: shared.minSeverity,
+      baselinePath: argv['update-baseline'] ? undefined : (argv.baseline as string | undefined),
+      disabledRules: shared.disabledRules,
+      maxHits,
+    });
+    return {
+      report,
+      getBaselineFindings: () => report.findings,
+    };
+  } finally {
+    process.off('SIGINT', onSigint);
+  }
+}
+
+function writeReport(
+  report: ExtendedAnalysisReport,
+  format: OutputFormat,
+  outputPath: string,
+  includeSuppressed: boolean
+): void {
+  if (format === 'sarif') {
+    const sarif = SarifReporter.build(report, { includeSuppressed });
+    const dir = path.dirname(outputPath);
+    if (dir && !fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(outputPath, JSON.stringify(sarif, null, 2), 'utf-8');
+    Logger.success(`SARIF report saved to ${outputPath}`);
+    return;
+  }
+
+  if (format === 'text') {
+    JSONReporter.writeTextReport(report, outputPath);
+    return;
+  }
+
+  JSONReporter.writeReport(report, outputPath);
+}
+
+function parseStringList(input: unknown): string[] | undefined {
+  if (!input) return undefined;
+  if (Array.isArray(input)) {
+    return input
+      .flatMap((entry) => String(entry).split(','))
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+  return String(input)
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function printRuleCatalog(): void {
+  const rules = listRules();
+  const rows = rules.map((rule) => ({
+    id: rule.id,
+    severity: rule.defaultSeverity,
+    category: rule.category,
+    heuristic: rule.heuristic ? 'yes' : 'no',
+    cwe: rule.cwe,
+    owasp: rule.owasp,
+    title: rule.title,
+    description: rule.description,
+  }));
+  // Write to stdout directly so `node dist/index.js --list-rules | jq .` works.
+  // Logger.info routes to stderr because the analyzer output normally pipes through
+  // stdout — but here the catalog IS the output.
+  process.stdout.write(JSON.stringify(rows, null, 2) + '\n');
 }
 
 async function main() {

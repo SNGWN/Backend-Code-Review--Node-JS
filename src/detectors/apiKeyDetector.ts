@@ -143,6 +143,7 @@ export class ApiKeyDetector {
           const severity = this.isTestEnvironment() ? 'HIGH' : 'CRITICAL';
 
           this.findings.push({
+            ruleId: 'BCR-KEY-001',
             category: 'API_KEY_EXPOSURE',
             severity,
             title: `Hardcoded ${serviceType} Key`,
@@ -176,26 +177,32 @@ export class ApiKeyDetector {
     propertyAssignments.forEach((node) => {
       const propAssign = node as ts.PropertyAssignment;
       const propName = propAssign.name?.getText().toLowerCase() || '';
-      const valueText = propAssign.initializer?.getText() || '';
+      const initializer = propAssign.initializer;
+      const valueText = initializer?.getText() || '';
       const { line, column } = this.parser.getLineAndColumn(node.getStart());
 
-      const isKeyProperty = /api[_-]?key|secret|token|password|key|auth/i.test(propName);
-      const hasHardcodedValue = /["'][\w\-\.]+["']/.test(valueText) && !this.isEnvironmentVariableReference(valueText);
+      // Tightened: the property name must read like a credential container (not just
+      // "key" — which fires on countless safe shapes like `{ keyExtractor, partitionKey }`).
+      const isKeyProperty = /\b(api[_-]?key|apikey|secret|access[_-]?token|refresh[_-]?token|password|passwd|pwd|client[_-]?secret|private[_-]?key|jwt[_-]?secret)\b/i.test(propName);
+      if (!isKeyProperty) return;
 
-      if (isKeyProperty && hasHardcodedValue) {
-        this.findings.push({
-          category: 'API_KEY_EXPOSURE',
-          severity: 'CRITICAL',
-          title: 'Hardcoded Key in Configuration File',
-          description: 'API key or secret is hardcoded in a configuration file. This file may be committed to version control or deployed with the application.',
-          file: this.filePath,
-          line,
-          column,
-          code: propAssign.getText().substring(0, 60),
-          recommendation: 'Use environment variables or a secrets manager. Remove from configuration files and add to .gitignore.',
-        });
+      // The value must be a non-env-var string literal that itself looks like a secret.
+      if (this.isEnvironmentVariableReference(valueText)) return;
+      if (!initializer || !ts.isStringLiteral(initializer)) return;
+      if (!this.looksLikeSecretValue(initializer.text)) return;
 
-      }
+      this.findings.push({
+        ruleId: 'BCR-KEY-002',
+        category: 'API_KEY_EXPOSURE',
+        severity: 'CRITICAL',
+        title: 'Hardcoded Key in Configuration File',
+        description: 'API key or secret is hardcoded in a configuration file. This file may be committed to version control or deployed with the application.',
+        file: this.filePath,
+        line,
+        column,
+        code: propAssign.getText().substring(0, 60),
+        recommendation: 'Use environment variables or a secrets manager. Remove from configuration files and add to .gitignore.',
+      });
     });
   }
 
@@ -230,6 +237,7 @@ export class ApiKeyDetector {
 
           if (isKeyParam && hasHardcodedDefault) {
             this.findings.push({
+              ruleId: 'BCR-KEY-003',
               category: 'API_KEY_EXPOSURE',
               severity: 'HIGH',
               title: 'Hardcoded Key in Function Default Parameter',
@@ -253,9 +261,18 @@ export class ApiKeyDetector {
     const sourceText = this.sourceFile.getFullText();
     const lines = sourceText.split('\n');
 
+    // Compute the line ranges that fall inside JSDoc blocks whose tags signal
+    // documentation/example content (`@swagger`, `@openapi`, `@example`). Real-world
+    // OpenAPI/Swagger annotations routinely embed sample JWTs and access tokens — those
+    // are documentation, not exposed secrets.
+    const docCommentRanges = computeDocCommentRanges(sourceText);
+
     lines.forEach((line, index) => {
       const lineNumber = index + 1;
-      
+      if (docCommentRanges.some((range) => lineNumber >= range.start && lineNumber <= range.end)) {
+        return;
+      }
+
       // Skip detector logic lines
       if (this.isDetectorLogicString(line)) {
         return;
@@ -263,7 +280,7 @@ export class ApiKeyDetector {
 
       // Check for comments containing keys
       if (line.includes('//') || line.includes('/*') || line.includes('*')) {
-        const comment = line.substring(line.indexOf('//') > -1 ? line.indexOf('//') : 
+        const comment = line.substring(line.indexOf('//') > -1 ? line.indexOf('//') :
                                       line.indexOf('/*') > -1 ? line.indexOf('/*') : 0);
         
         for (const [serviceName, pattern] of Object.entries(this.API_KEY_PATTERNS)) {
@@ -272,6 +289,7 @@ export class ApiKeyDetector {
           }
 
           this.findings.push({
+            ruleId: 'BCR-KEY-004',
             category: 'API_KEY_EXPOSURE',
             severity: 'HIGH',
             title: `${this.extractServiceType(serviceName)} Key in Comment`,
@@ -313,6 +331,7 @@ export class ApiKeyDetector {
           }
 
           this.findings.push({
+            ruleId: 'BCR-KEY-005',
             category: 'API_KEY_EXPOSURE',
             severity: 'CRITICAL',
             title: `${this.extractServiceType(serviceName)} Key in Logs`,
@@ -351,6 +370,7 @@ export class ApiKeyDetector {
           }
 
           this.findings.push({
+            ruleId: 'BCR-KEY-006',
             category: 'API_KEY_EXPOSURE',
             severity: 'HIGH',
             title: `${this.extractServiceType(serviceName)} Key in Error Message`,
@@ -386,6 +406,7 @@ export class ApiKeyDetector {
 
       if (dbConnectionPattern.test(text) && hasCredentials && this.isInAssignmentContext(node)) {
         this.findings.push({
+          ruleId: 'BCR-KEY-007',
           category: 'API_KEY_EXPOSURE',
           severity: 'CRITICAL',
           title: 'Database Credentials in Connection String',
@@ -568,18 +589,20 @@ export class ApiKeyDetector {
   }
 
   private looksLikeSecretValue(text: string): boolean {
-    if (text.length < 12 || /\s/.test(text) || /^[a-z]+(?:-[a-z]+)+$/.test(text)) {
+    if (text.length < 12 || /\s/.test(text)) return false;
+    // Reject obvious label / header / kebab-word shapes.
+    if (/^[a-z]+(?:[-_][a-z]+)+$/i.test(text) && !/\d/.test(text)) return false;
+    if (/^[xX]-[A-Za-z][A-Za-z0-9-]*$/.test(text)) return false;
+    if (/^[A-Z][A-Za-z0-9]*(?:[-_][A-Z][A-Za-z0-9]*)+$/.test(text) && !/\d/.test(text)) return false;
+    // Sentinel words.
+    if (/^(changeme|your[_-]?(secret|key|token)|placeholder|example|sample|test|todo)([_-].*)?$/i.test(text)) {
       return false;
     }
 
-    if (/^[A-Fa-f0-9]{24,}$/.test(text)) {
-      return true;
-    }
+    if (/^[A-Fa-f0-9]{24,}$/.test(text)) return true;
 
     const classes = [/[a-z]/, /[A-Z]/, /\d/, /[_./+=-]/].filter((pattern) => pattern.test(text)).length;
-    if (classes >= 3) {
-      return true;
-    }
+    if (classes >= 3 && (/\d/.test(text) || text.length >= 20)) return true;
 
     return /[A-Za-z0-9._+=/-]{20,}/.test(text) && /\d/.test(text);
   }
@@ -627,4 +650,25 @@ export class ApiKeyDetector {
 
     return serviceMap[patternName] || 'API';
   }
+}
+
+/**
+ * Returns line ranges (1-based, inclusive) that fall inside a JSDoc-style block whose
+ * leading tags indicate documentation / API spec content. Used by `BCR-KEY-004` to
+ * suppress findings inside swagger / openapi / @example blocks where sample JWTs and
+ * placeholder tokens are routine.
+ */
+function computeDocCommentRanges(source: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const blockRegex = /\/\*\*([\s\S]*?)\*\//g;
+  let match: RegExpExecArray | null;
+  while ((match = blockRegex.exec(source)) !== null) {
+    const body = match[1];
+    if (!/@(swagger|openapi|example|api|exampleresponse|exampleobject)\b/i.test(body)) continue;
+    const before = source.slice(0, match.index);
+    const startLine = before.split('\n').length;
+    const endLine = startLine + match[0].split('\n').length - 1;
+    ranges.push({ start: startLine, end: endLine });
+  }
+  return ranges;
 }

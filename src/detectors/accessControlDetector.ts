@@ -13,6 +13,7 @@ import {
   isSensitiveRouteContext,
   isUserControlledExpression,
 } from '../utils/detectorLogic';
+import { computePocId } from '../rules/fingerprint';
 
 /**
  * Access Control Detector
@@ -97,6 +98,7 @@ export class AccessControlDetector {
       }
 
       const finding: Finding = {
+        ruleId: 'BCR-AC-001',
         category: 'ACCESS_CONTROL',
         severity: 'HIGH',
         title: 'Missing Authorization Check on Sensitive Endpoint',
@@ -140,6 +142,7 @@ export class AccessControlDetector {
       ) {
         const { line, column } = this.parser.getLineAndColumn(node.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-AC-002',
           category: 'ACCESS_CONTROL',
           severity: 'CRITICAL',
           title: 'BOLA: Predictable ID Used Without Ownership Check',
@@ -170,30 +173,37 @@ export class AccessControlDetector {
     });
 
     dbQueries.forEach((node) => {
+      const callExpr = node as ts.CallExpression;
+      // Tightened: require AT LEAST ONE argument to be user-controlled. Previously
+      // matched on the *substring* "id" in the call text, which fired on every
+      // `findById(constant)` and `whereLike` call.
+      const hasUserControlledArg = callExpr.arguments.some((arg) =>
+        isUserControlledExpression(arg, this.sourceFile)
+      );
+      if (!hasUserControlledArg) return;
+
       const text = node.getText();
       const parent = getEnclosingScopeText(node, this.sourceFile);
 
-      // If ID is passed but no user/owner check
-      if (/id|req\.params|req\.body|req\.query/i.test(text)) {
-        const hasOwnerVerification = hasOwnershipCheck(parent) || text.toLowerCase().includes('owner');
+      const hasOwnerVerification = hasOwnershipCheck(parent) || text.toLowerCase().includes('owner');
 
-        if (!hasOwnerVerification && parent.length > 20) {
-          const { line, column } = this.parser.getLineAndColumn(node.getStart());
-          const finding: Finding = {
-            category: 'ACCESS_CONTROL',
-            severity: 'HIGH',
-            title: 'Missing Ownership Verification (Horizontal Escalation)',
-            description: 'Database query retrieves a resource by ID without verifying the current user owns it. Attackers can access any resource by changing the ID parameter.',
-            file: this.filePath,
-            line,
-            column,
-            code: text.substring(0, 60),
-            recommendation: 'Add an additional condition to the query to verify user ownership: AND user_id = req.user.id or similar.',
-          };
+      if (!hasOwnerVerification && parent.length > 20) {
+        const { line, column } = this.parser.getLineAndColumn(node.getStart());
+        const finding: Finding = {
+          ruleId: 'BCR-AC-003',
+          category: 'ACCESS_CONTROL',
+          severity: 'HIGH',
+          title: 'Missing Ownership Verification (Horizontal Escalation)',
+          description: 'Database query retrieves a resource by ID without verifying the current user owns it. Attackers can access any resource by changing the ID parameter.',
+          file: this.filePath,
+          line,
+          column,
+          code: text.substring(0, 60),
+          recommendation: 'Add an additional condition to the query to verify user ownership: AND user_id = req.user.id or similar.',
+        };
 
-          this.findings.push(finding);
-          this.generateAccessControlPoc(finding, text, line);
-        }
+        this.findings.push(finding);
+        this.generateAccessControlPoc(finding, text, line);
       }
     });
   }
@@ -208,13 +218,24 @@ export class AccessControlDetector {
       const funcText = func.getText().toLowerCase();
       const funcName = func.name?.text.toLowerCase() || '';
 
-      // Check for admin/sensitive functions without proper role checks
-      if (/admin|delete|update|settings|permissions|role|assign/i.test(funcName)) {
+      // Two-tier gating:
+      // - Strict sensitive-name set: only verbs that imply credentialed action.
+      // - Body must perform SERVER-SIDE MUTATION (db./model./.save()/etc), and
+      // - The function must NOT be a generic factory (`function f<T>(...)`). Generic
+      //   parametric helpers like `createDataLoader<T>(obj, options)` were the dominant
+      //   FP shape in the real-world audit — they touch `repository.` but never see
+      //   actual user input.
+      const isSensitiveName = /^(admin|delete|destroy|remove|grant|revoke|impersonate|assignrole|setrole|setpermissions|escalate)/i.test(funcName);
+      const performsMutation = /(req|request)\.(body|params|query|headers|cookies)|db\.|database\.|repository\.|repo\.|model\.|service\.|\.save\(|\.delete(?:all|many|one)?\(|\.update(?:many|one)?\(|\.insert(?:many|one)?\(|\.create(?:many|one)?\(/i.test(funcText);
+      const isGenericFactory = (func.typeParameters?.length ?? 0) > 0;
+
+      if (isSensitiveName && performsMutation && !isGenericFactory) {
         const hasRoleCheck = hasAuthorizationProtection(funcText);
 
         if (!hasRoleCheck) {
           const { line, column } = this.parser.getLineAndColumn(func.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-AC-004',
             category: 'ACCESS_CONTROL',
             severity: 'CRITICAL',
             title: 'Potential Privilege Escalation (Vertical)',
@@ -258,9 +279,10 @@ export class AccessControlDetector {
         if (isUserInput) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-AC-005',
             category: 'ACCESS_CONTROL',
             severity: 'CRITICAL',
-              title: 'IDOR: Direct Object Reference Without Access Check',
+            title: 'IDOR: Direct Object Reference Without Access Check',
             description: 'Object is accessed directly using user-supplied ID without verifying the user has access permission. This allows attackers to access any object by changing the ID.',
             file: this.filePath,
             line,
@@ -281,7 +303,7 @@ export class AccessControlDetector {
    */
   private generateAccessControlPoc(finding: Finding, vulnerableCode: string, line: number): void {
     const poc: ProofOfConcept = {
-      id: `access-control-${line}-${Date.now()}`,
+      id: computePocId('access-control', this.filePath, line, vulnerableCode),
       title: finding.title,
       description: finding.description,
       vulnerabilityType: 'ACCESS_CONTROL',

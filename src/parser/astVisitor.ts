@@ -45,6 +45,19 @@ export class ASTVisitor {
 
     if (!functionName) return calls;
 
+    // Support qualified names like "Object.assign". Previously this matched only the
+    // property-access *name*, so `findCallExpressions(node, 'Object.assign')` returned
+    // every `.assign()` call and never the qualified form — BCR-MA-001 silently never fired.
+    if (functionName.includes('.')) {
+      const [expectedReceiver, expectedProp] = functionName.split('.');
+      return calls.filter((call) => {
+        if (!ts.isPropertyAccessExpression(call.expression)) return false;
+        const receiver = call.expression.expression;
+        const receiverName = ts.isIdentifier(receiver) ? receiver.text : '';
+        return receiverName === expectedReceiver && call.expression.name.text === expectedProp;
+      });
+    }
+
     return calls.filter((call) => {
       if (ts.isIdentifier(call.expression)) {
         return call.expression.text === functionName;

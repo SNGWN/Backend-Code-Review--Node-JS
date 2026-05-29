@@ -92,12 +92,10 @@ export class Logger {
         })
       : this.formatText(level, message, meta);
 
-    if (level === 'warn' || level === 'error') {
-      console.error(output);
-      return;
-    }
-
-    console.log(output);
+    // Everything goes to stderr so stdout stays clean for `--output -` style consumers
+    // and so a future `--stdout` mode can stream JSON/SARIF over stdout without ANSI
+    // banners or progress text mixing in.
+    console.error(output);
   }
 
   private static formatText(level: LogLevel, message: string, meta?: LogMeta): string {

@@ -1,20 +1,55 @@
 {
   "name": "backend-code-review--node-js",
   "version": "1.0.0",
-  "description": "Node.js CLI tool for analyzing TypeScript backend code for security issues",
+  "description": "Two-mode security scanner for Node.js / TypeScript backends: static SAST on source + PCI / PDPL / secret review on Kibana / Elasticsearch logs. SARIF, baseline, stable rule IDs, CWE / OWASP mapping.",
+  "keywords": [
+    "security",
+    "static-analysis",
+    "sast",
+    "appsec",
+    "sarif",
+    "typescript",
+    "nodejs",
+    "owasp",
+    "cwe",
+    "cli",
+    "pci-dss",
+    "pdpl",
+    "kibana",
+    "elasticsearch",
+    "log-review",
+    "secret-scanning"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/backend-code-review-node-js.git"
+  },
+  "homepage": "https://github.com/example/backend-code-review-node-js#readme",
+  "bugs": {
+    "url": "https://github.com/example/backend-code-review-node-js/issues"
+  },
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "code-review": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && tsc",
+    "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && tsc && node -e \"const fs=require('fs');const p='dist/index.js';fs.writeFileSync(p,'#!/usr/bin/env node\\n'+fs.readFileSync(p,'utf-8'));fs.chmodSync(p,0o755);\"",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "jest --coverage",
+    "scan:self": "node dist/index.js --path ./src --format sarif --output bcr-self.sarif --include-heuristics"
   },
-  "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",

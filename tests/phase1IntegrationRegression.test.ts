@@ -95,7 +95,12 @@ describe('Phase 1 integration/regression coverage', () => {
     );
     const injectionFinding = result.findings.find((finding) => finding.title === 'Log Injection Risk');
 
-    expect(sensitiveLogFindings).toHaveLength(10);
+    // Was 10 before tightening:
+    //   - Dropped the "cc"-substring FP that matched inside unrelated words like
+    //     "successfully" (line 36 of the fixture).
+    //   - Skipped the plain string-literal `'Bearer token:'` arg (line 24) — label
+    //     text without an actual secret, the rest of the args on the same line still fire.
+    expect(sensitiveLogFindings).toHaveLength(8);
     expect(lowerCaseDescriptions.some((description) => description.includes('password'))).toBe(true);
     expect(lowerCaseDescriptions.some((description) => description.includes('token'))).toBe(true);
     expect(lowerCaseDescriptions.some((description) => description.includes('ssn'))).toBe(true);

@@ -1,0 +1,74 @@
+# Real-world bank log shapes that LOOK sensitive but are safe.
+# Every line below must produce ZERO findings in default mode.
+# The harness reads this file and scans each line individually.
+
+# (1) Trace / correlation / request IDs (look like hashes, not credentials)
+request_id=abc-def-1234567890abcdef trace=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 span=00f067aa0ba902b7
+correlation 2025070512345678 request completed in 12ms
+ULID: 01ARZ3NDEKTSV4RRFFQ69G5FAV processed
+
+# (2) Container / pod / node IDs (long random strings, not JWTs)
+container=k8s_payments_paymentsvc-5d7b9c8f-abc12_default_8f6a9b1c2d3e4f5a6b7c8d9e0f1a2b3c
+pod=paymentsvc-deployment-7d8b9c-xyz45 node=ip-10-0-1-23.eu-central-1.compute.internal
+
+# (3) Numeric IDs that pass Luhn but are NOT card brands (e.g. starting with 2 or 1)
+order_id=2123456789012348 processed
+correlation=1234567890123452 forwarded
+sequence_no=8765432109876541 acknowledged
+
+# (4) HTTP access logs without credentials
+GET /api/orders/12345 200 1234ms client=10.0.1.45 ua="Mozilla/5.0"
+POST /api/payments/process 201 567ms size=1024
+
+# (5) Common JSON access logs with non-sensitive fields
+{"timestamp":"2026-05-29T12:00:00Z","level":"info","message":"order processed","orderId":"ord_12345","amount":99.99,"currency":"AED"}
+{"req_id":"r-12345","duration_ms":12,"status":200,"route":"/api/health"}
+
+# (6) Numeric values that resemble PAN length but are NOT card BINs
+order=4444 invoice=11111111 total=222.22
+batch_size=99999999999999 throughput=1234567890123456789
+
+# (7) Strings with "password" or "secret" as labels but no actual value
+"password reset link sent to customer", status: "completed"
+log message: "secret revealed by user action" (this is documentation copy)
+key features include OAuth, ldap, and password rotation
+
+# (8) Email-shaped strings that are NOT customer PII (operational service accounts)
+runner@ci.bank.internal triggered deployment of revision sha-abc1234
+sender=alerts@ops.bank.internal subject="batch completed"
+
+# (9) Phone numbers from documentation / formats that aren't UAE customers
+helpdesk +1-800-555-0100 contacted
+tested with sample 9999999999 placeholder
+
+# (10) Stack-trace-shaped paths without sensitive directories
+at /var/app/dist/payments/processor.js:123:45
+at /opt/svc/node_modules/express/lib/router/index.js:281:22
+
+# (11) Connection strings WITHOUT credentials (just host)
+mongodb://db.bank.internal:27017/payments connected
+redis://cache.bank.internal:6379 ping ok
+
+# (12) Operational labels with high-entropy values that aren't secrets
+build_sha=4e7d9f2c8b1a5d6e3f0c7b9a2d5e8f1c4b7a0d3 deployed
+image=registry.bank.ae/payments:sha-1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+
+# (13) IBAN-shaped strings that fail mod-97 (typos / test fixtures)
+notional-IBAN AE070331234567890123457 in testing
+invalid-IBAN GB29NWBK60161331926820 (single-digit flip)
+
+# (14) Emirates-ID-shaped strings with out-of-range year
+sample-id 784-9999-1234567-8 (placeholder, year out of range)
+test-fixture 784-1899-1234567-8 (placeholder, year out of range)
+
+# (15) Bearer / JWT shapes that aren't credentials (short, not 3-segment)
+Token-Bearer is the auth scheme used
+context: eyJonlyOneSegment
+
+# (16) AWS-shaped strings that aren't keys
+AKIDevelopment-Tag this is not a key
+bucket name aki-data-archive
+
+# (17) URLs in logs (no creds embedded)
+upstream https://api.partner.example.com/v1/status responded 200
+webhook target: https://hooks.example.com/incoming/abc123

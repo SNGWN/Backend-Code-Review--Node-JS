@@ -4,8 +4,8 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 
 /**
- * Event Stream Injection Detector (Phase 3)
- * 
+ * Event Stream Injection Detector
+ *
  * Detects event-driven architecture vulnerabilities:
  * - Injecting malicious event payloads
  * - Event handler bypass via crafted events
@@ -48,6 +48,7 @@ export class EventStreamDetector {
         file: this.filePath,
         line: lineNum,
         column: 0,
+        ruleId: 'BCR-EVT-001',
         severity: 'HIGH',
         category: 'EVENT_STREAM',
         title: 'Exploitable Event Handler Injection via Untrusted Payload',
@@ -75,6 +76,7 @@ export class EventStreamDetector {
         file: this.filePath,
         line: lineNum,
         column: 0,
+        ruleId: 'BCR-EVT-002',
         severity: 'HIGH',
         category: 'EVENT_STREAM',
         title: 'User-Controlled Event Name Enables Handler Abuse',
@@ -103,6 +105,7 @@ export class EventStreamDetector {
       file: this.filePath,
       line: lineNum,
       column: 0,
+      ruleId: 'BCR-EVT-003',
       severity: 'HIGH',
       category: 'EVENT_STREAM',
       title: 'Missing Tenant Scoping in Sensitive Event Handler',

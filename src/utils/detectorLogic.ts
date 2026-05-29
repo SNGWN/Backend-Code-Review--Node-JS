@@ -25,21 +25,26 @@ export interface RateLimitConfig {
   usesDistributedStore: boolean;
 }
 
+// Tighter than the original list: removed generic tokens (`user`, `auth`, `login`,
+// `register`, `key`, `order`, `profile`, `settings`, `token`) that fire on hundreds of
+// non-sensitive endpoints. Kept tokens that meaningfully imply credentialed action.
 const SENSITIVE_ROUTE_PATTERN =
-  /(admin|profile|settings|role|permission|secret|key|export|payment|billing|invoice|order|password|forgot|reset|token|auth|login|register|user)/i;
+  /(admin|permission|secret|apikey|password|forgot|reset|payment|billing|invoice|export|webhook|impersonate|grant|revoke)/i;
 const SENSITIVE_HANDLER_PATTERN =
   /(delete|destroy|remove|update|save\(|insert|create|grant|assign|role|permission|admin|export|secret|apikey|token|password|billing|payment)/i;
 const AUTH_CONTEXT_PATTERN =
   /(authmiddleware|authorizationmiddleware|requireauth|ensureauth|passport\.authenticate|jwt\.verify|verifytoken|validatetoken|authenticate|protect|guard|req\.user|currentuser|res\.locals\.user|ctx\.state\.user|request\.user)/i;
 const AUTHZ_CONTEXT_PATTERN =
-  /(authorize|authorization|permission|role|scope|forbidden|status\(403\)|statusCode\s*=\s*403|hasrole|haspermission|canaccess|accessdenied|isadmin)/i;
+  /(authorize|authorization|permission|role|scope|forbidden|status\(403\)|statusCode\s*=\s*403|hasrole|haspermission|canaccess|accessdenied|isadmin|requireadmin|requirerole|requirescope|requirepermission|adminonly|adminguard|withadmin|withrole)/i;
 const OWNERSHIP_RESOURCE_PATTERN =
   /(owner|ownerid|userid|user_id|accountid|tenantid|organizationid|orgid|resource\.userid|resource\.ownerid)/i;
 const RATE_LIMIT_NAME_PATTERN = /(ratelimit|ratelimiter|limiter|throttle|throttler)/i;
 const UNTRUSTED_INPUT_PATTERN =
   /(req|request)\.(body|query|params|headers|cookies)|ctx\.request|userinput|userdata|payload|socket\.on\(|window\.|document\./i;
+// Anchor each name with \b so library tokens don't match inside unrelated identifiers
+// (e.g. `joi` inside `path.join`, `yup` inside `cleanup`, `zod` inside `lazod`).
 const VALIDATION_BOUNDARY_PATTERN =
-  /(joi|yup|zod|validator|express-validator|safeparse|schema|allowlist|whitelist|sanitize|pick\(|omit\(|stripunknown|strict\()/i;
+  /\b(joi|yup|zod|validator|express[-_]?validator|safe[-_]?parse|schema|allowlist|whitelist|sanitize|stripUnknown|strict)\b|\b(pick|omit)\s*\(/i;
 const FINDING_METADATA_FIELDS = new Set([
   'category',
   'title',
@@ -96,11 +101,28 @@ export function isPathLikeLiteral(text: string): boolean {
   return text.includes('/') || text.includes('\\') || text.startsWith('.');
 }
 
+/**
+ * Receivers we'll accept as honest Express/Fastify/Koa-style route definitions.
+ * Without this gate, supertest's `request(app).post(...)` chains in test files were
+ * extracted as routes and produced cascade auth/authz FPs.
+ */
+const ROUTE_RECEIVER_PATTERN = /^(app|router|api|express|server|fastify|koa|hono|nest)/i;
+
 export function getRouteHandlerContexts(
   sourceFile: ts.SourceFile,
   parser: ASTParser
 ): RouteHandlerContext[] {
   const routes: RouteHandlerContext[] = [];
+  // Test files routinely call .post()/.get()/etc. via supertest, jest mocks, or
+  // describe/it harness wrappers. None of those represent real routes — and the false
+  // positives dominated detection noise on every backend boilerplate we tested.
+  // We only match by FILENAME (`*.test.ts`, `*.spec.ts`) or by being inside a
+  // `__tests__` directory — not just any path containing "tests/", because our own
+  // project's fixtures live under `tests/fixtures/`.
+  const fileName = sourceFile.fileName.toLowerCase();
+  if (/\.(test|spec)\.tsx?$|\/__tests__\//.test(fileName)) {
+    return routes;
+  }
 
   ASTVisitor.findCallExpressions(sourceFile).forEach((callExpression) => {
     if (!ts.isPropertyAccessExpression(callExpression.expression)) {
@@ -109,6 +131,14 @@ export function getRouteHandlerContexts(
 
     const method = callExpression.expression.name.text.toLowerCase();
     if (!HTTP_METHODS.includes(method)) {
+      return;
+    }
+
+    // Receiver must look like an Express-style app/router. `request(app).post(...)`
+    // (supertest), `userService.get(...)` (DI service), `axios.get(...)`, etc. are
+    // not routes.
+    const receiverText = getReceiverChainHead(callExpression.expression.expression, sourceFile);
+    if (!receiverText || !ROUTE_RECEIVER_PATTERN.test(receiverText)) {
       return;
     }
 
@@ -145,17 +175,22 @@ export function isSensitiveRouteContext(route: RouteHandlerContext): boolean {
   const normalizedPath = route.path.toLowerCase();
   const handlerText = route.handlerText.toLowerCase();
 
-  if (['delete', 'put', 'patch'].includes(route.method)) {
-    return true;
-  }
+  // Dropped the bare "DELETE/PUT/PATCH = sensitive" auto-flag. Most authenticated APIs
+  // have routine PUT/DELETE endpoints (preferences, soft-deletes, edits); flagging all
+  // of them produced cascade FPs. We now require the path OR handler to signal
+  // credentialed action.
 
   if (SENSITIVE_ROUTE_PATTERN.test(normalizedPath)) {
     return true;
   }
 
+  // Tightened gate: the handler must include EVIDENCE OF MUTATION (db/model/repo calls
+  // or .save()/.update()/etc.). Previous version accepted `res.json` alone, which
+  // matched every JSON-returning endpoint whose handler text incidentally contained
+  // any of `password|token|secret|admin` etc. — far too permissive.
   return (
     SENSITIVE_HANDLER_PATTERN.test(handlerText) &&
-    /(req\.(body|params|query)|db\.|model\.|repository\.|service\.|res\.json)/i.test(handlerText)
+    /(db\.|database\.|model\.|repository\.|repo\.|service\.|\.save\s*\(|\.update(?:one|many|byid)?\s*\(|\.delete(?:one|many|byid|where)?\s*\(|\.insert(?:one|many)?\s*\(|\.create(?:one|many)?\s*\(|\.remove\s*\(|\.upsert\s*\(|config\.update|setrole|grantrole|assignrole)/i.test(handlerText)
   );
 }
 
@@ -299,7 +334,10 @@ function readRateLimitConfig(
         keyGeneratorText
       ),
     hasTrustedProxyProtection:
-      /trustedproxies|trust proxy|isinternalnetwork|getclientip|proxy-addr/.test(keyGeneratorText),
+      // Original signals (trusted proxy infra) PLUS per-user binding: when the rate
+      // limit key includes a verified user id (req.user.id, currentUser.id, etc.),
+      // IP-spoofing alone can't bypass the limit.
+      /trustedproxies|trust proxy|isinternalnetwork|getclientip|proxy-addr|req\.user|currentuser|res\.locals\.user|ctx\.state\.user|request\.user|\.user\?\.id|\.user\.id|user\?\.\w+|user\.\w+/.test(keyGeneratorText),
     usesMemoryStore: /memorystore|memory/.test(storeText || outerText.toLowerCase()),
     usesDistributedStore: /redis|redisstore|memcached|cluster|storeclient/.test(storeText),
   };
@@ -398,4 +436,37 @@ function resolveIdentifierDeclaration(
   }
 
   return undefined;
+}
+
+/**
+ * Walk the receiver chain (`app.use(...).post(...)` → `app`; `router.route('/x').get(...)` → `router`)
+ * to find the head identifier name. Returns null for non-identifier roots like
+ * `someCall(...)` so supertest's `request(app).post(...)` doesn't qualify as a route.
+ */
+function getReceiverChainHead(node: ts.Node, sourceFile: ts.SourceFile): string | null {
+  let current: ts.Node | undefined = node;
+  while (current) {
+    if (ts.isIdentifier(current)) {
+      return current.text;
+    }
+    if (ts.isPropertyAccessExpression(current)) {
+      current = current.expression;
+      continue;
+    }
+    if (ts.isCallExpression(current)) {
+      // `request(app).post(...)` — the receiver is itself a call. That's NOT an
+      // express-style route definition. We do allow `router.use('/x', auth).post(...)`
+      // because `.use(...)` chains stay PropertyAccess.
+      const calleeText = current.expression.getText(sourceFile);
+      // Specifically reject supertest-style `request(...)` calls.
+      if (/^(request|chai|supertest|superagent|axios|fetch|got)$/i.test(calleeText)) {
+        return null;
+      }
+      // Otherwise traverse into the call's callee — `router.route('/x').get(...)`.
+      current = current.expression;
+      continue;
+    }
+    return null;
+  }
+  return null;
 }

@@ -5,6 +5,7 @@ import { ASTParser } from '../parser/astParser';
 import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
 import { hasValidationBoundary, isUntrustedInputText } from '../utils/detectorLogic';
+import { TaintTracker } from '../utils/taint';
 
 /**
  * Insecure Deserialization Detector
@@ -28,6 +29,7 @@ export class DeserializationDetector {
   private sourceFile: ts.SourceFile;
   private parser: ASTParser;
   private untrustedVariables = new Set<string>();
+  private taintTracker: TaintTracker | null = null;
 
   constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
     this.filePath = filePath;
@@ -43,6 +45,7 @@ export class DeserializationDetector {
   detect(): DetectorResult {
     this.findings = [];
     this.untrustedVariables.clear();
+    this.taintTracker = new TaintTracker(this.sourceFile);
 
     this.buildUntrustedVariableMap();
     this.detectUnsafeJsonParse();
@@ -51,8 +54,50 @@ export class DeserializationDetector {
     this.detectUnsafeObjectAssign();
     this.detectUnsafeSpreadOperator();
     this.detectGadgetChainPatterns();
+    this.detectBase64Deserialization();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * BCR-VAL-012: `Buffer.from(x, 'base64').toString(...)` where `x` is user-controlled.
+   * Common in poorly-implemented Basic auth and webhook signature verification; the
+   * decoded string typically flows into JSON.parse or credential splitting.
+   */
+  private detectBase64Deserialization(): void {
+    ASTVisitor.findNodes(this.sourceFile, (node) => ts.isCallExpression(node)).forEach((node) => {
+      const call = node as ts.CallExpression;
+      const callee = call.expression;
+      if (!ts.isPropertyAccessExpression(callee)) return;
+      if (callee.name.text !== 'from') return;
+      if (!ts.isIdentifier(callee.expression) || callee.expression.text !== 'Buffer') return;
+      // Second argument must be the literal 'base64'.
+      const second = call.arguments[1];
+      if (!second || !ts.isStringLiteral(second) || second.text.toLowerCase() !== 'base64') return;
+
+      const first = call.arguments[0];
+      if (!first) return;
+      if (!this.referencesUntrustedAlias(first)) return;
+
+      // Only fire when the result is consumed by `.toString(...)` — that's the
+      // deserialization step that exposes the application to attacker-controlled bytes.
+      const parent = call.parent;
+      if (!parent || !ts.isPropertyAccessExpression(parent) || parent.name.text !== 'toString') return;
+
+      const { line, column } = this.parser.getLineAndColumn(node.getStart());
+      this.findings.push({
+        ruleId: 'BCR-VAL-012',
+        category: 'VALIDATION',
+        severity: 'HIGH',
+        title: 'Insecure Deserialization From Base64',
+        description: 'Buffer.from(<user>, "base64").toString(...) decodes attacker-controlled base64 and exposes downstream parsing to malformed bytes.',
+        file: this.filePath,
+        line,
+        column,
+        code: node.getText().substring(0, 140),
+        recommendation: 'Validate the decoded payload against a strict schema. For Basic auth use `basic-auth`; for webhook signatures verify HMAC BEFORE decoding.',
+      });
+    });
   }
 
   /**
@@ -88,19 +133,12 @@ export class DeserializationDetector {
   }
 
   private referencesUntrustedAlias(node: ts.Node): boolean {
-    const text = node.getText();
-    if (isUntrustedInputText(text)) {
+    // Use scope-aware tracker — replaces the prior `\b${variable}\b` regex that collided
+    // on common identifier names ("data", "input", "result").
+    if (this.taintTracker?.isTainted(node)) {
       return true;
     }
-
-    for (const variable of this.untrustedVariables) {
-      const variablePattern = new RegExp(`\\b${variable}\\b`);
-      if (variablePattern.test(text)) {
-        return true;
-      }
-    }
-
-    return false;
+    return isUntrustedInputText(node.getText());
   }
 
   /**
@@ -110,36 +148,36 @@ export class DeserializationDetector {
    */
   private detectUnsafeJsonParse(): void {
     const jsonParseCalls = ASTVisitor.findNodes(this.sourceFile, (node) => {
-      if (ts.isCallExpression(node)) {
-        const name = ASTVisitor.getCallExpressionName(node);
-        return name === 'JSON.parse' || name === 'parse';
-      }
-      return false;
+      if (!ts.isCallExpression(node)) return false;
+      const expr = node.expression;
+      if (!ts.isPropertyAccessExpression(expr)) return false;
+      const objectName = ts.isIdentifier(expr.expression) ? expr.expression.text : '';
+      // Strict: only JSON.parse, not arbitrary `.parse()` (which matches z.parse(), parser.parse(), etc.).
+      return objectName === 'JSON' && expr.name.text === 'parse';
     });
 
     jsonParseCalls.forEach((node) => {
       const callExpr = node as ts.CallExpression;
-      if (callExpr.arguments.length > 0) {
-        const firstArg = callExpr.arguments[0];
-        const argText = firstArg.getText();
+      if (callExpr.arguments.length === 0) return;
+      const firstArg = callExpr.arguments[0];
 
-        if (this.isUntrustedInput(argText) && !hasValidationBoundary(callExpr, this.sourceFile)) {
-          const { line, column } = this.parser.getLineAndColumn(node.getStart());
-          const finding: Finding = {
-            category: 'VALIDATION',
-            severity: 'CRITICAL',
-            title: 'Unsafe JSON.parse with User Input',
-            description: 'User input is directly passed to JSON.parse without sanitization. This can lead to prototype pollution attacks via __proto__ gadgets.',
-            file: this.filePath,
-            line,
-            column,
-            code: node.getText(),
-            recommendation: 'Validate JSON structure using a JSON schema validator. Use JSON.parse with a reviver function to filter out __proto__ and constructor properties.',
-          };
+      if (this.referencesUntrustedAlias(firstArg) && !hasValidationBoundary(callExpr, this.sourceFile)) {
+        const { line, column } = this.parser.getLineAndColumn(node.getStart());
+        const finding: Finding = {
+          ruleId: 'BCR-VAL-005',
+          category: 'VALIDATION',
+          severity: 'CRITICAL',
+          title: 'Unsafe JSON.parse with User Input',
+          description: 'User input is directly passed to JSON.parse without sanitization. This can lead to prototype pollution attacks via __proto__ gadgets.',
+          file: this.filePath,
+          line,
+          column,
+          code: node.getText(),
+          recommendation: 'Validate JSON structure using a JSON schema validator. Use JSON.parse with a reviver function to filter out __proto__ and constructor properties.',
+        };
 
-          this.generateDeserializationPoc(finding, 'JSON_PARSE_POLLUTION');
-          this.findings.push(finding);
-        }
+        this.generateDeserializationPoc(finding, 'JSON_PARSE_POLLUTION');
+        this.findings.push(finding);
       }
     });
   }
@@ -162,11 +200,11 @@ export class DeserializationDetector {
       const callExpr = node as ts.CallExpression;
       if (callExpr.arguments.length > 0) {
         const firstArg = callExpr.arguments[0];
-        const argText = firstArg.getText();
 
-        if (this.isUntrustedInput(argText) && !hasValidationBoundary(callExpr, this.sourceFile)) {
+        if (this.referencesUntrustedAlias(firstArg) && !hasValidationBoundary(callExpr, this.sourceFile)) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-VAL-006',
             category: 'VALIDATION',
             severity: 'CRITICAL',
             title: 'Code Injection via eval() Deserialization',
@@ -201,10 +239,11 @@ export class DeserializationDetector {
       const rightText = binExpr.right.getText();
 
       // Check for __proto__ or constructor.prototype pollution
-      if ((leftText.includes('__proto__') || leftText.includes('constructor.prototype')) && 
-          this.isUntrustedInput(rightText)) {
+      if ((leftText.includes('__proto__') || leftText.includes('constructor.prototype')) &&
+          (this.isUntrustedInput(rightText) || this.referencesUntrustedAlias(binExpr.right))) {
         const { line, column } = this.parser.getLineAndColumn(node.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-VAL-007',
           category: 'VALIDATION',
           severity: 'CRITICAL',
           title: 'Prototype Pollution Vulnerability',
@@ -241,11 +280,12 @@ export class DeserializationDetector {
       if (callExpr.arguments.length >= 2) {
         // Check if any source argument is untrusted
         for (let i = 1; i < callExpr.arguments.length; i++) {
-          const sourceArg = callExpr.arguments[i].getText();
-          
-          if (this.isUntrustedInput(sourceArg) && !hasValidationBoundary(callExpr, this.sourceFile)) {
+          const sourceArgNode = callExpr.arguments[i];
+
+          if (this.referencesUntrustedAlias(sourceArgNode) && !hasValidationBoundary(callExpr, this.sourceFile)) {
             const { line, column } = this.parser.getLineAndColumn(node.getStart());
             const finding: Finding = {
+              ruleId: 'BCR-VAL-008',
               category: 'VALIDATION',
               severity: 'HIGH',
               title: 'Unsafe Object.assign with Untrusted Data',
@@ -278,14 +318,14 @@ export class DeserializationDetector {
 
     spreadElements.forEach((node) => {
       const spreadExpr = node as ts.SpreadAssignment | ts.SpreadElement;
-      const expressionText = spreadExpr.expression.getText();
 
-        if (this.isUntrustedInput(expressionText) && !hasValidationBoundary(spreadExpr, this.sourceFile)) {
+      if (this.referencesUntrustedAlias(spreadExpr.expression) && !hasValidationBoundary(spreadExpr, this.sourceFile)) {
         // Check if spreading into an object
         const parent = spreadExpr.parent;
         if (parent && ts.isObjectLiteralExpression(parent)) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-VAL-009',
             category: 'VALIDATION',
             severity: 'HIGH',
             title: 'Unsafe Object Spread with Untrusted Data',
@@ -331,8 +371,8 @@ export class DeserializationDetector {
       const args = callExpr.arguments;
       let hasUntrustedArg = false;
 
-      args.forEach(arg => {
-        if (this.isUntrustedInput(arg.getText())) {
+      args.forEach((arg) => {
+        if (this.referencesUntrustedAlias(arg)) {
           hasUntrustedArg = true;
         }
       });
@@ -340,10 +380,11 @@ export class DeserializationDetector {
       if (
         hasUntrustedArg &&
         !hasValidationBoundary(callExpr, this.sourceFile) &&
-        gadgetPatterns.some(pattern => pattern.test(text))
+        gadgetPatterns.some((pattern) => pattern.test(text))
       ) {
         const { line, column } = this.parser.getLineAndColumn(node.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-VAL-010',
           category: 'VALIDATION',
           severity: 'HIGH',
           title: 'Potential Gadget Chain Usage',
@@ -369,16 +410,22 @@ export class DeserializationDetector {
    * @private
    */
   private isUntrustedInput(text: string): boolean {
-    // Check if it's a variable that's known to be untrusted
-    const tokens = text.split(/[\.\[\]]/);
-    const varName = tokens[0].trim();
-
-    if (this.untrustedVariables.has(varName)) {
+    // Direct sources first (req.body, req.query, etc.).
+    if (isUntrustedInputText(text)) {
       return true;
     }
 
-    // Check for direct untrusted sources
-    return isUntrustedInputText(text);
+    // Single-identifier accesses can be cheaply matched against the legacy untrusted
+    // variable set, but only with strict word-boundary matching against the *first
+    // identifier*. Compound expressions are evaluated via the scope-aware tracker
+    // through referencesUntrustedAlias() at the AST entry points.
+    const tokens = text.split(/[\.\[\]]/);
+    const varName = tokens[0].trim();
+    if (varName && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(varName) && this.untrustedVariables.has(varName)) {
+      return true;
+    }
+
+    return false;
   }
 
   /**

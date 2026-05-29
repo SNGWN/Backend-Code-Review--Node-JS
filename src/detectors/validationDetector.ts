@@ -10,6 +10,8 @@ import {
   hasValidationBoundary,
   isUntrustedInputText,
 } from '../utils/detectorLogic';
+import { TaintTracker } from '../utils/taint';
+import { buildImportAliasMap, ImportAlias, resolveCalleeToExportedName } from '../utils/importAliases';
 
 /**
  * Parameter Validation Detector
@@ -38,7 +40,9 @@ export class ParameterValidationDetector {
    */
   private validatedVariables = new Set<string>();
   private taintedVariables = new Set<string>();
-  
+  private taintTracker: TaintTracker | null = null;
+  private aliasMap: Map<string, ImportAlias> = new Map();
+
   /**
    * POC Generator for injection vulnerabilities
    */
@@ -61,12 +65,54 @@ export class ParameterValidationDetector {
     this.findings = [];
     this.validatedVariables.clear();
     this.taintedVariables.clear();
+    this.taintTracker = new TaintTracker(this.sourceFile);
+    this.aliasMap = buildImportAliasMap(this.sourceFile);
 
     this.buildValidationMap();
     this.buildTaintMap();
     this.detectDangerousSinkUsage();
+    this.detectTaggedTemplateSqlInjection();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * Detects tagged template literals used as SQL builders with user-controlled
+   * substitutions. Pattern: `sql\`SELECT * FROM x WHERE id=${req.params.id}\``.
+   *
+   * Common tag identifiers in the ecosystem: `sql`, `SQL`, `db.sql`, `slonik.sql`,
+   * `prisma.$queryRawUnsafe`. We anchor on these names rather than substring-match
+   * to keep FP low (e.g. `html\`...\``, `css\`...\``, `gql\`...\`` are out of scope).
+   */
+  private detectTaggedTemplateSqlInjection(): void {
+    const tagged = ASTVisitor.findNodes(this.sourceFile, (node) => ts.isTaggedTemplateExpression(node));
+    tagged.forEach((node) => {
+      const tagExpr = (node as ts.TaggedTemplateExpression).tag;
+      const tagText = tagExpr.getText(this.sourceFile);
+      if (!/^(sql|SQL|db\.sql|slonik\.sql|raw|knex\.raw|prisma\.\$queryRaw(?:Unsafe)?|pgPromise\.as)$/.test(tagText)) {
+        return;
+      }
+      const template = (node as ts.TaggedTemplateExpression).template;
+      if (!ts.isTemplateExpression(template)) return;
+
+      const taintedSpan = template.templateSpans.find((span) => this.referencesTaintedInput(span.expression));
+      if (!taintedSpan) return;
+
+      const { line, column } = this.parser.getLineAndColumn(node.getStart());
+      this.findings.push({
+        ruleId: 'BCR-VAL-011',
+        category: 'VALIDATION',
+        severity: 'CRITICAL',
+        title: 'SQL Injection via Tagged-Template With Tainted Substitution',
+        description: 'A tagged SQL template embeds user-controlled data as a substitution. Most SQL template tags do NOT auto-parameterize substitutions.',
+        file: this.filePath,
+        line,
+        column,
+        code: node.getText().substring(0, 160),
+        recommendation:
+          'Use parameterized placeholders (driver-specific `?` or `$1`) or constrain dynamic field names through a server-side allowlist.',
+      });
+    });
   }
 
   /**
@@ -153,6 +199,7 @@ export class ParameterValidationDetector {
 
       const { line, column } = this.parser.getLineAndColumn(callExpr.getStart());
       const finding: Finding = {
+        ruleId: sink.ruleId,
         category: 'VALIDATION',
         severity: sink.severity,
         title: sink.title,
@@ -170,22 +217,50 @@ export class ParameterValidationDetector {
   }
 
   private getDangerousSink(callExpr: ts.CallExpression): {
+    ruleId: string;
     title: string;
     description: string;
     recommendation: string;
     severity: 'CRITICAL' | 'HIGH';
   } | null {
-    const callName = ASTVisitor.getCallExpressionName(callExpr) || callExpr.expression.getText();
-    const hasInterpolatedQueryArg = callExpr.arguments.some(
-      (arg) =>
-        ts.isTemplateExpression(arg) ||
-        (ts.isBinaryExpression(arg) &&
-          arg.operatorToken.kind === ts.SyntaxKind.PlusToken &&
-          /select|insert|update|delete|where|query/i.test(arg.getText()))
-    );
+    const localCallName = ASTVisitor.getCallExpressionName(callExpr) || callExpr.expression.getText();
+    // Resolve renamed imports — `import { exec as runShell } from 'child_process'`
+    // should still match dangerous-API rules even though the local name is `runShell`.
+    const resolvedExportedName = resolveCalleeToExportedName(callExpr, this.aliasMap)?.exportedName;
+    const callName = resolvedExportedName ?? localCallName;
+    // Anchor the SQL-call name to exact dangerous patterns instead of substring matches —
+    // avoids "executeMigration", "rawValue", "userQuery" etc.
+    const sqlCallNamePattern = /^(query|execute|raw|exec|run|all|get|prepare)$/i;
 
-    if (/query|execute|raw/i.test(callName) && hasInterpolatedQueryArg) {
+    // Receiver shape: the object the method is called on must look DB-like. Without
+    // this gate, `axios.get(\`https://${host}/...\`)`, `path.get(...)`, `req.query.get(...)`
+    // all incorrectly matched as SQL.
+    const expr = callExpr.expression;
+    const receiverText = ts.isPropertyAccessExpression(expr)
+      ? expr.expression.getText(this.sourceFile)
+      : '';
+    const dbLikeReceiver = /\b(db|database|conn|connection|pool|client|sql|knex|sqlite|pg|postgres|mysql|mariadb|mssql|sequelize|tx|trx|transaction|repo|repository|datasource|prisma)\b/i.test(receiverText);
+
+    // The argument must look like a SQL string: interpolated AND contain SQL keywords
+    // (kept from original logic). For template literals, also check the head text.
+    const hasInterpolatedQueryArg = callExpr.arguments.some((arg) => {
+      if (ts.isTemplateExpression(arg)) {
+        const fullText = arg.getText(this.sourceFile);
+        return /\b(select|insert|update|delete|from|where|join|having|union)\b/i.test(fullText);
+      }
+      if (
+        ts.isBinaryExpression(arg) &&
+        arg.operatorToken.kind === ts.SyntaxKind.PlusToken &&
+        /\b(select|insert|update|delete|from|where|join|having)\b/i.test(arg.getText())
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (sqlCallNamePattern.test(callName) && dbLikeReceiver && hasInterpolatedQueryArg) {
       return {
+        ruleId: 'BCR-VAL-001',
         title: 'Unvalidated Input Reaches SQL Query Construction',
         description: 'User-controlled input is interpolated into a raw SQL query. This is directly exploitable for SQL injection when the request value is attacker-controlled.',
         recommendation: 'Use parameterized queries or ORM placeholders. Validate and constrain dynamic field names through a server-side allowlist.',
@@ -193,11 +268,15 @@ export class ParameterValidationDetector {
       };
     }
 
+    // Search-helper rule kept but tightened: require the *receiver* to look DB-like.
+    // `receiverText` is already computed above.
     if (
-      /search/i.test(callName) &&
+      /^search$/i.test(callName) &&
+      /\b(db|database|repo|repository|model|query)\b/i.test(receiverText) &&
       callExpr.arguments.some((arg) => /query|filter|term|search/i.test(arg.getText()))
     ) {
       return {
+        ruleId: 'BCR-VAL-001',
         title: 'Unvalidated Input Reaches SQL Query Construction',
         description: 'User-controlled search terms reach a backend query-construction helper without a visible allowlist or validation boundary. If the helper builds raw database predicates, this becomes directly exploitable.',
         recommendation: 'Constrain searchable fields and operators through a server-side allowlist, and bind user values through parameterized query APIs instead of dynamic predicate construction.',
@@ -205,8 +284,10 @@ export class ParameterValidationDetector {
       };
     }
 
-    if (/exec|spawn|fork|execsync|spawnsync/i.test(callName)) {
+    // Anchored command-execution call names — no "execute" substring (caught above).
+    if (/^(exec|execSync|spawn|spawnSync|fork|execFile|execFileSync)$/i.test(callName)) {
       return {
+        ruleId: 'BCR-VAL-002',
         title: 'Unvalidated Input Reaches Command Execution',
         description: 'User-controlled input flows into an operating system command sink. Attackers can inject shell metacharacters and execute arbitrary commands.',
         recommendation: 'Avoid shell invocation with request data. Use safe APIs with fixed arguments and strict allowlists.',
@@ -214,8 +295,11 @@ export class ParameterValidationDetector {
       };
     }
 
-    if (/eval|function|settimeout|setinterval/i.test(callName)) {
+    // eval and Function constructor are the genuine dynamic-code sinks.
+    // setTimeout/setInterval are only dangerous when the FIRST arg is a string — check arg shape.
+    if (/^eval$/i.test(callName) || /^Function$/.test(callName)) {
       return {
+        ruleId: 'BCR-VAL-003',
         title: 'Unvalidated Input Reaches Dynamic Code Execution',
         description: 'User-controlled input reaches a dynamic code execution sink. This enables code injection or arbitrary script execution.',
         recommendation: 'Remove dynamic code execution for untrusted data. Parse structured input instead of evaluating it.',
@@ -223,44 +307,50 @@ export class ParameterValidationDetector {
       };
     }
 
-    if (/readfile|writefile|appendfile|sendfile|open|createreadstream|createwritestream/i.test(callName)) {
+    if (/^(setTimeout|setInterval)$/.test(callName)) {
+      const first = callExpr.arguments[0];
+      // Only flag the string-arg form. Function-arg is the normal usage and not dangerous.
+      const isStringForm =
+        first &&
+        (ts.isStringLiteral(first) ||
+          ts.isTemplateExpression(first) ||
+          ts.isNoSubstitutionTemplateLiteral(first) ||
+          (ts.isBinaryExpression(first) && first.operatorToken.kind === ts.SyntaxKind.PlusToken));
+      if (!isStringForm) return null;
       return {
-        title: 'Unvalidated Input Reaches File-System Sink',
-        description: 'User-controlled input reaches a file-system API without path validation. Attackers can pivot this into path traversal or arbitrary file overwrite/read behavior.',
-        recommendation: 'Canonicalize paths, enforce directory allowlists, and reject user-controlled traversal sequences before file access.',
-        severity: 'HIGH',
+        ruleId: 'BCR-VAL-003',
+        title: 'Unvalidated Input Reaches Dynamic Code Execution',
+        description: 'User-controlled input reaches a dynamic code execution sink. This enables code injection or arbitrary script execution.',
+        recommendation: 'Remove dynamic code execution for untrusted data. Parse structured input instead of evaluating it.',
+        severity: 'CRITICAL',
       };
     }
+
+    // Dropped: bare fs-sink detection moved into the dedicated SsrfDetector
+    // (BCR-PT-001), which has tighter containment checks and emits a Path-Traversal
+    // category rather than the older overlap-prone VALIDATION/BCR-VAL-004 finding.
+    // BCR-VAL-004 stays in the rule registry for baseline stability but is no longer
+    // emitted — the path-traversal detector covers this surface with fewer FPs.
 
     return null;
   }
 
-  private referencesTaintedInput(node: ts.Node): boolean {
-    const text = node.getText();
 
-    if (isUntrustedInputText(text)) {
+  private referencesTaintedInput(node: ts.Node): boolean {
+    if (this.taintTracker?.isTainted(node)) {
+      // Cross-check the validated-variables set: if the AST identifier resolves to a
+      // declaration the user explicitly passed through joi/yup/zod/etc., respect that.
+      const text = node.getText();
+      for (const variable of this.validatedVariables) {
+        // Treat any direct reference to a validated alias as a detaint signal.
+        if (new RegExp(`(^|[^A-Za-z0-9_$])${variable}([^A-Za-z0-9_$]|$)`).test(text)) {
+          return false;
+        }
+      }
       return true;
     }
 
-    for (const variable of this.taintedVariables) {
-      const variablePattern = new RegExp(`\\b${variable}\\b`);
-      if (variablePattern.test(text) && !this.isValidated(variable)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Checks if a variable has been validated using validation libraries
-   *
-   * @param varName - The variable name to check
-   * @returns true if the variable is in the validated set, false otherwise
-   * @private
-   */
-  private isValidated(varName: string): boolean {
-    return this.validatedVariables.has(varName);
+    return isUntrustedInputText(node.getText());
   }
 
   /**

@@ -66,25 +66,10 @@ export class ASTParser {
 
   getLineAndColumn(position: number): { line: number; column: number } {
     if (!this.sourceFile) return { line: 1, column: 1 };
-    
-    const lineBreaks = this.sourceFile.getLineStarts();
-    let line = 1;
-    let col = 1;
-
-    for (let i = 0; i < lineBreaks.length; i++) {
-      if (lineBreaks[i] > position) {
-        line = i;
-        col = position - lineBreaks[i - 1] + 1;
-        break;
-      }
-    }
-
-    if (position >= lineBreaks[lineBreaks.length - 1]) {
-      line = lineBreaks.length;
-      col = position - lineBreaks[lineBreaks.length - 1] + 1;
-    }
-
-    return { line, column: col };
+    // Use TS's own line/character resolver instead of the previous hand-rolled scan,
+    // which had competing return paths and incorrect math at position 0.
+    const result = this.sourceFile.getLineAndCharacterOfPosition(Math.max(0, position));
+    return { line: result.line + 1, column: result.character + 1 };
   }
 
   getCodeSnippet(position: number, length: number = 50): string {

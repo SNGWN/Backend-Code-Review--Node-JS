@@ -6,6 +6,7 @@ import { PocMarkdownReportGenerator } from '../poc/PocMarkdownReportGenerator';
 import { ProofOfConcept } from '../poc/types';
 import { Logger } from '../utils/logger';
 import { getEnclosingScopeText } from '../utils/detectorLogic';
+import { computePocId } from '../rules/fingerprint';
 
 /**
  * JWT Token Validation Bypass Detector
@@ -103,6 +104,7 @@ export class JwtBypassDetector {
       // Check if there's corresponding verify call
       if (!this.hasVerifyCall(code)) {
         const finding: Finding = {
+          ruleId: 'BCR-JWT-001',
           category: 'AUTHENTICATION',
           severity: 'CRITICAL',
           title: 'JWT Signature Not Verified',
@@ -157,6 +159,7 @@ export class JwtBypassDetector {
           optionsText.includes('"none"')
         ) {
           const finding: Finding = {
+            ruleId: 'BCR-JWT-002',
             category: 'AUTHENTICATION',
             severity: 'CRITICAL',
             title: 'Algorithm Confusion Attack - None Algorithm Allowed',
@@ -178,6 +181,7 @@ export class JwtBypassDetector {
         // Check if no algorithms are specified (allows any algorithm)
         if (!optionsText.includes('algorithm')) {
           const finding: Finding = {
+            ruleId: 'BCR-JWT-003',
             category: 'AUTHENTICATION',
             severity: 'HIGH',
             title: 'Missing Algorithm Specification',
@@ -231,6 +235,7 @@ export class JwtBypassDetector {
           code.includes('HS256')
         ) {
           const finding: Finding = {
+            ruleId: 'BCR-JWT-004',
             category: 'AUTHENTICATION',
             severity: 'CRITICAL',
             title: 'Key Confusion Attack - Public Key with HMAC',
@@ -256,6 +261,13 @@ export class JwtBypassDetector {
    * Detects weak JWT secrets (less than 32 characters)
    */
   private detectWeakSecrets(): void {
+    // File-scope guard: the JWT-weak-secret rule only fires when the file actually uses
+    // jwt.sign/jwt.verify or imports jsonwebtoken. Without this, STORAGE_KEY and similar
+    // would fire on every backend file just because they have key|secret|token in the name.
+    if (!/jsonwebtoken|\bjwt\.(sign|verify)\b|\bJWT\.(sign|verify)\b/.test(this.fileContent)) {
+      return;
+    }
+
     const variableDeclarations = ASTVisitor.findNodes(this.sourceFile, (node): boolean => {
       return (
         ts.isVariableDeclaration(node) &&
@@ -266,12 +278,13 @@ export class JwtBypassDetector {
 
     variableDeclarations.forEach((node) => {
       const varDecl = node as ts.VariableDeclaration;
-      const varName = (varDecl.name as ts.Identifier).text;
+      if (!ts.isIdentifier(varDecl.name)) return;
+      const varName = varDecl.name.text;
 
       if (
         varName.toLowerCase().includes('secret') ||
-        varName.toLowerCase().includes('key') ||
-        varName.toLowerCase().includes('token')
+        varName.toLowerCase().includes('signingkey') ||
+        /jwt|hmac/i.test(varName)
       ) {
         const initializer = varDecl.initializer as ts.StringLiteral;
         const secretValue = initializer.text;
@@ -282,6 +295,7 @@ export class JwtBypassDetector {
           const code = this.getCodeSnippet(line);
 
           const finding: Finding = {
+            ruleId: 'BCR-JWT-005',
             category: 'AUTHENTICATION',
             severity: 'HIGH',
             title: 'Weak JWT Secret Key',
@@ -331,6 +345,7 @@ export class JwtBypassDetector {
         // Check if ignoreExpiration is set to true or if no ignoreExpiration check
         if (optionsText.includes('ignoreExpiration: true') || optionsText.includes('ignoreExpiration:true')) {
           const finding: Finding = {
+            ruleId: 'BCR-JWT-006',
             category: 'AUTHENTICATION',
             severity: 'HIGH',
             title: 'JWT Expiration Check Disabled',
@@ -375,6 +390,7 @@ export class JwtBypassDetector {
         (rightText.includes('decode') || rightText.includes('jwt'))
       ) {
         const finding: Finding = {
+          ruleId: 'BCR-JWT-007',
           category: 'AUTHENTICATION',
           severity: 'HIGH',
           title: 'Cached JWT Without Expiration Validation',
@@ -421,6 +437,7 @@ export class JwtBypassDetector {
         // Check if kid validation is missing
         if (!this.hasKidValidation(code)) {
           const finding: Finding = {
+            ruleId: 'BCR-JWT-008',
             category: 'AUTHENTICATION',
             severity: 'MEDIUM',
             title: 'Missing Key ID (kid) Validation',
@@ -486,7 +503,7 @@ export class JwtBypassDetector {
     code: string
   ): void {
     const poc: ProofOfConcept = {
-      id: `jwt-${vulnerabilityType}-${finding.line}-${Date.now()}`,
+      id: computePocId(`jwt-${vulnerabilityType}`, this.filePath, finding.line, code),
       title: finding.title,
       description: finding.description,
       vulnerabilityType: 'JWT_BYPASS',

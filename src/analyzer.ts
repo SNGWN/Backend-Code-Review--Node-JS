@@ -5,8 +5,8 @@ import {
   AnalysisReport,
   DetectorResult,
   Finding,
-  IssueCategory,
   RuntimeIssue,
+  Severity,
 } from './types';
 import { ASTParser } from './parser/astParser';
 import { AuthenticationDetector } from './detectors/authDetector';
@@ -24,11 +24,16 @@ import { DataExposureDetector } from './detectors/dataExposureDetector';
 import { CachePoisoningDetector } from './detectors/cachePoisoningDetector';
 import { MessageQueueDetector } from './detectors/messageQueueDetector';
 import { EventStreamDetector } from './detectors/eventStreamDetector';
+import { SsrfDetector } from './detectors/ssrfDetector';
+import { MisconfigurationDetector } from './detectors/misconfigurationDetector';
 import { FileHelper } from './utils/helpers';
 import { ProofOfConcept } from './poc/types';
 import { PocMarkdownReportGenerator } from './poc/PocMarkdownReportGenerator';
 import { JSONReporter } from './reporter';
 import { Logger } from './utils/logger';
+import { getRule, isHeuristic, severityAtLeast, severityRank } from './rules/registry';
+import { computeFingerprint, normalizePath } from './rules/fingerprint';
+import { Baseline, buildInlineSuppressions, isLineSuppressed } from './rules/baseline';
 
 interface DetectorWithPocs {
   detect(): DetectorResult;
@@ -45,21 +50,60 @@ interface DetectorFactory {
   ) => DetectorWithPocs;
 }
 
-interface AnalysisOptions {
+export interface AnalysisOptions {
+  /**
+   * Include heuristic (lower-confidence) rules in the report. When false (default),
+   * findings whose ruleId is marked `heuristic: true` in the rule registry are filtered.
+   */
   includeHeuristics?: boolean;
+  /**
+   * Minimum severity threshold for the report. Findings below this severity are dropped.
+   * Default: CRITICAL when `--exploitable-only` semantics apply, otherwise LOW.
+   */
+  minSeverity?: Severity;
+  /**
+   * Path to a baseline JSON file. Findings matching a baseline entry by fingerprint are
+   * suppressed and surfaced under `suppressedFindings`.
+   */
+  baselinePath?: string;
+  /**
+   * Explicit list of ruleIds to disable (case-insensitive).
+   */
+  disabledRules?: string[];
+  /**
+   * When true, also include suppressed findings in the returned report's
+   * `suppressedFindings` (the main `findings` array stays clean).
+   */
+  showSuppressed?: boolean;
+}
+
+/**
+ * Extended report shape carrying suppression data the SARIF reporter needs.
+ */
+export interface ExtendedAnalysisReport extends AnalysisReport {
+  suppressedFindings?: Finding[];
 }
 
 /**
  * Backend Code Review Analyzer
  *
- * Orchestrates detector execution over TypeScript files and aggregates findings/POCs.
+ * Orchestrates detector execution over TypeScript files, applies rule-registry-based
+ * filtering (severity threshold, baseline, inline suppression, heuristic gating), and
+ * emits a deterministic, fingerprinted finding stream consumable by JSON, text, or SARIF
+ * reporters.
  */
 export class BackendCodeReviewAnalyzer {
   private findings: Finding[] = [];
+  private suppressedFindings: Finding[] = [];
   private filesAnalyzed = 0;
   private generatedPocs: ProofOfConcept[] = [];
   private runtimeIssues: RuntimeIssue[] = [];
   private analysisOptions: AnalysisOptions = {};
+  /**
+   * Per-file inline suppression maps. Keyed by absolute file path.
+   */
+  private inlineSuppressionByFile = new Map<string, Map<number, ReturnType<typeof buildInlineSuppressions> extends Map<number, infer V> ? V : never>>();
+  private baseline: Baseline | null = null;
   private detectorFactories: DetectorFactory[] = [
     {
       name: 'AuthenticationDetector',
@@ -121,11 +165,32 @@ export class BackendCodeReviewAnalyzer {
       name: 'EventStreamDetector',
       create: (filePath, sourceFile, parser) => new EventStreamDetector(filePath, sourceFile, parser),
     },
+    {
+      name: 'SsrfDetector',
+      create: (filePath, sourceFile, parser) => new SsrfDetector(filePath, sourceFile, parser),
+    },
+    {
+      name: 'MisconfigurationDetector',
+      create: (filePath, sourceFile, parser) => new MisconfigurationDetector(filePath, sourceFile, parser),
+    },
   ];
 
-  analyze(targetPath: string, options: AnalysisOptions = {}): AnalysisReport {
+  analyze(targetPath: string, options: AnalysisOptions = {}): ExtendedAnalysisReport {
     this.resetState();
     this.analysisOptions = options;
+    if (options.baselinePath) {
+      try {
+        this.baseline = new Baseline(options.baselinePath);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.addRuntimeIssue({
+          type: 'FATAL_ANALYSIS_FAILURE',
+          severity: 'ERROR',
+          message: `Failed to load baseline: ${errorMessage}`,
+        });
+        Logger.runtimeError(`Failed to load baseline: ${errorMessage}`);
+      }
+    }
 
     try {
       const files = this.getTargetFiles(targetPath);
@@ -158,6 +223,10 @@ export class BackendCodeReviewAnalyzer {
     return this.generatedPocs.filter((poc) => this.matchesPocToFinding(poc, reportFindings));
   }
 
+  /**
+   * Legacy alias for callers that filter findings by "exploitable" classification.
+   * Now backed by the rule registry's severity + heuristic flag.
+   */
   getExploitableFindings(findings: Finding[] = this.findings): Finding[] {
     return findings.filter((finding) => this.isExploitableFinding(finding));
   }
@@ -221,11 +290,22 @@ export class BackendCodeReviewAnalyzer {
     return PocMarkdownReportGenerator.saveComprehensiveReport(pocs, summary, outputPath);
   }
 
+  /**
+   * Returns the in-memory finding stream that would feed a baseline (post-fingerprinting,
+   * pre-suppression). Exposed for `--update-baseline` callers.
+   */
+  getAllFindingsWithFingerprints(): Finding[] {
+    return [...this.findings];
+  }
+
   private resetState(): void {
     this.findings = [];
+    this.suppressedFindings = [];
     this.generatedPocs = [];
     this.filesAnalyzed = 0;
     this.runtimeIssues = [];
+    this.inlineSuppressionByFile.clear();
+    this.baseline = null;
   }
 
   private getTargetFiles(targetPath: string): string[] {
@@ -269,6 +349,12 @@ export class BackendCodeReviewAnalyzer {
       return;
     }
 
+    // Build per-file inline suppressions once — reused by every detector's findings.
+    this.inlineSuppressionByFile.set(
+      filePath,
+      buildInlineSuppressions(sourceFile.getFullText())
+    );
+
     const relPath = path.relative(process.cwd(), filePath);
     Logger.info(`  ✓ ${relPath}`);
 
@@ -306,136 +392,120 @@ export class BackendCodeReviewAnalyzer {
     return [];
   }
 
-  private generateReport(): AnalysisReport {
+  private generateReport(): ExtendedAnalysisReport {
     const reportFindings = this.getReportFindings();
-    return JSONReporter.generateReport(reportFindings, this.filesAnalyzed, [...this.runtimeIssues]);
+    const baseReport = JSONReporter.generateReport(reportFindings, this.filesAnalyzed, [...this.runtimeIssues]);
+    const extended: ExtendedAnalysisReport = { ...baseReport };
+    if (this.suppressedFindings.length > 0) {
+      extended.suppressedFindings = this.suppressedFindings.map((finding) => this.enrichForReport(finding));
+    }
+    return extended;
   }
 
+  /**
+   * Legacy "exploitable" filter — preserved for back-compat callers. The new gating
+   * logic is in `getReportFindings()` (severity threshold + heuristic flag + baseline +
+   * inline suppression). This method is now a thin wrapper that says: "would this be in
+   * the default report with the exploit-focused defaults?"
+   */
   private isExploitableFinding(finding: Finding): boolean {
-    if (finding.severity === 'CRITICAL') {
+    // Default semantics: CRITICAL always counts; non-heuristic HIGH counts.
+    if (finding.severity === 'CRITICAL') return true;
+    if (finding.severity === 'HIGH' && finding.ruleId && !isHeuristic(finding.ruleId)) {
       return true;
     }
-
-    const combinedText = `${finding.title} ${finding.description}`;
-    const excludedTitlePatterns = [
-      /global-only rate limiting without per-user limits/i,
-      /missing key id \(kid\) validation/i,
-      /unsafe object\.assign with untrusted data/i,
-      /unsafe object spread with untrusted data/i,
-      /weak hashing:/i,
-      /missing rate limiting on sensitive endpoint/i,
-      /missing field whitelisting/i,
-    ];
-
-    if (excludedTitlePatterns.some((pattern) => pattern.test(combinedText))) {
-      return false;
-    }
-
-    const patternsByCategory: Partial<Record<IssueCategory, Record<'HIGH' | 'MEDIUM' | 'LOW', RegExp[]>>> = {
-      AUTHENTICATION: {
-        HIGH: [
-          /jwt|token|algorithm confusion|key confusion|weak jwt secret|expiration check disabled|cached jwt/i,
-          /sensitive function without auth guard/i,
-          /hardcoded secret/i,
-        ],
-        MEDIUM: [],
-        LOW: [],
-      },
-      VALIDATION: {
-        HIGH: [
-          /unvalidated input reaches/i,
-          /unsafe json\.parse/i,
-          /code injection via eval/i,
-          /prototype pollution/i,
-          /potential gadget chain usage/i,
-        ],
-        MEDIUM: [],
-        LOW: [],
-      },
-      LOGGING: {
-        HIGH: [/sensitive data in logs|log injection risk/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      MASS_ASSIGNMENT: {
-        HIGH: [
-          /direct object\.assign with user input/i,
-          /unvalidated field assignment/i,
-          /prototype pollution vulnerability/i,
-          /constructor\/prototype property assignment/i,
-        ],
-        MEDIUM: [],
-        LOW: [],
-      },
-      ACCESS_CONTROL: {
-        HIGH: [/authorization check on sensitive endpoint|ownership verification|privilege escalation|idor|bola/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      RATE_LIMITING: {
-        HIGH: [
-          /rate limit bypass via header manipulation/i,
-          /weak rate limiting on sensitive endpoint/i,
-          /distributed rate limit bypass via load balancer/i,
-        ],
-        MEDIUM: [],
-        LOW: [],
-      },
-      BUSINESS_LOGIC: {
-        HIGH: [/race condition|idempotency|time-of-check|client-controlled price|inventory over-selling/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      API_KEY_EXPOSURE: {
-        HIGH: [/hardcoded|key in logs|key in comment|key in error message|database credentials/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      CRYPTO_WEAKNESS: {
-        HIGH: [/predictable token with math\.random|hardcoded cryptographic key/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      DATA_EXPOSURE: {
-        HIGH: [/sensitive field .* exposed in response|unfiltered sensitive data in api response/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      CACHE_POISONING: {
-        HIGH: [/cache poisoning/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      MESSAGE_QUEUE: {
-        HIGH: [/queue consumer deserialization|unsigned queue publish|integrity not verified before ack/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-      EVENT_STREAM: {
-        HIGH: [/event handler injection|event name enables handler abuse|tenant scoping/i],
-        MEDIUM: [],
-        LOW: [],
-      },
-    };
-
-    const categoryPatterns = patternsByCategory[finding.category];
-    if (!categoryPatterns) {
-      return false;
-    }
-
-    const severityPatterns = categoryPatterns[finding.severity as 'HIGH' | 'MEDIUM' | 'LOW'] || [];
-    return severityPatterns.some((pattern) => pattern.test(combinedText));
+    return false;
   }
 
   private getReportFindings(): Finding[] {
-    const visibleFindings = this.analysisOptions.includeHeuristics
-      ? [...this.findings]
-      : this.getExploitableFindings(this.findings);
+    const enriched = this.findings.map((finding) => this.enrichForReport(finding));
+    const suppressedAccumulator: Finding[] = [];
+    const includeHeuristics = this.analysisOptions.includeHeuristics === true;
+    const minSeverity: Severity = this.analysisOptions.minSeverity
+      ?? (includeHeuristics ? 'LOW' : 'HIGH');
+    const disabledRules = new Set(
+      (this.analysisOptions.disabledRules ?? []).map((id) => id.toUpperCase())
+    );
 
-    return visibleFindings.map((finding) => ({
+    const visible: Finding[] = [];
+
+    for (const finding of enriched) {
+      // 1. Rule-id disable
+      if (finding.ruleId && disabledRules.has(finding.ruleId.toUpperCase())) {
+        continue;
+      }
+
+      // 2. Heuristic gate (default report drops heuristic rules; legacy "exploitable" subset preserved)
+      const heuristicFlag = finding.ruleId ? isHeuristic(finding.ruleId) : false;
+      if (heuristicFlag && !includeHeuristics) {
+        continue;
+      }
+
+      // 3. Severity threshold
+      if (!severityAtLeast(finding.severity, minSeverity)) {
+        continue;
+      }
+
+      // 4. Inline suppression
+      const inlineMap = this.inlineSuppressionByFile.get(this.toAbsoluteFile(finding.file));
+      if (inlineMap) {
+        const result = isLineSuppressed(inlineMap, finding.line, finding.ruleId);
+        if (result.suppressed) {
+          suppressedAccumulator.push({
+            ...finding,
+            suppressed: { source: 'inline', reason: result.reason },
+          });
+          continue;
+        }
+      }
+
+      // 5. Baseline suppression
+      if (this.baseline) {
+        const entry = this.baseline.match(finding);
+        if (entry) {
+          suppressedAccumulator.push({
+            ...finding,
+            suppressed: { source: 'baseline', reason: entry.reason },
+          });
+          continue;
+        }
+      }
+
+      visible.push(finding);
+    }
+
+    this.suppressedFindings = suppressedAccumulator;
+
+    // Deterministic sort: severity desc, then file asc, then line asc, then ruleId asc.
+    visible.sort((a, b) => {
+      const severityDiff = severityRank(b.severity) - severityRank(a.severity);
+      if (severityDiff !== 0) return severityDiff;
+      if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+      if (a.line !== b.line) return a.line - b.line;
+      const aRule = a.ruleId ?? '';
+      const bRule = b.ruleId ?? '';
+      return aRule < bRule ? -1 : aRule > bRule ? 1 : 0;
+    });
+
+    return visible;
+  }
+
+  /**
+   * Backfill rule-registry metadata + fingerprint, and normalize file path for display.
+   */
+  private enrichForReport(finding: Finding): Finding {
+    const ruleId = finding.ruleId;
+    const rule = ruleId ? getRule(ruleId) : undefined;
+
+    const enriched: Finding = {
       ...finding,
       file: this.toDisplayPath(finding.file),
-    }));
+      cwe: finding.cwe ?? rule?.cwe,
+      owasp: finding.owasp ?? rule?.owasp,
+    };
+
+    enriched.fingerprint = enriched.fingerprint ?? computeFingerprint(enriched);
+    return enriched;
   }
 
   private getDirectoryIgnorePatterns(targetPath: string): string[] {
@@ -535,9 +605,14 @@ export class BackendCodeReviewAnalyzer {
   }
 
   private toDisplayPath(filePath: string): string {
-    const relativePath = path.isAbsolute(filePath)
-      ? path.relative(process.cwd(), filePath)
-      : filePath;
-    return relativePath.split(path.sep).join('/');
+    return normalizePath(filePath);
   }
+
+  private toAbsoluteFile(displayOrAbsolute: string): string {
+    if (path.isAbsolute(displayOrAbsolute)) {
+      return displayOrAbsolute;
+    }
+    return path.resolve(process.cwd(), displayOrAbsolute);
+  }
+
 }

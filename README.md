@@ -1,38 +1,27 @@
 # Backend Code Review Scanner
 
-Static security scanner for Node.js and TypeScript backends.
+Two-mode security scanner for Node.js / TypeScript backends. Built for AppSec engineers
+running in CI:
 
-It parses `.ts` and `.tsx` code locally with the TypeScript AST, prioritizes exploit-relevant findings, writes JSON or text reports, and exposes proof-of-concept helpers through the analyzer API.
+- **`--mode code`** (default): static SAST over local source. SARIF / baseline / severity
+  thresholds / 60+ rules with CWE + OWASP mapping.
+- **`--mode logs`**: Kibana / Elasticsearch log review. Scans the last N days of a
+  container's logs for PCI-DSS (PAN with Luhn, CVV, track data), UAE PDPL / PII
+  (Emirates ID, IBAN with mod-97, phone, passport), and secrets in logs (passwords,
+  Bearer / JWT, service API keys, private keys, DB connection strings).
 
-## Highlights
+Both modes emit the same Finding shape — same SARIF output, same baseline format, same
+fail-on / min-severity gating. AppSec teams ingest both code and log findings through one
+pipeline.
 
-- Local, static analysis only — no external API calls
-- Default output is exploit-focused to keep reports lower-noise
-- JSON and text report formats for CI and human review
-- Structured runtime issue reporting for invalid targets, parse failures, and detector failures
-- Programmatic POC export helpers for supported finding types
+## What it produces
 
-## Detector coverage
+- **Findings** with stable `ruleId`, CWE list, OWASP category, content-addressed fingerprint
+- **JSON** report (default), **text** summary, or **SARIF 2.1.0** for GitHub code scanning
+  / DefectDojo / SonarQube ingest
+- **POC artifacts** (markdown) for supported exploit-ready finding classes
 
-Current detector coverage includes checks for:
-
-- authentication weaknesses
-- validation and injection issues
-- sensitive logging
-- mass assignment
-- access control flaws
-- rate-limiting weaknesses
-- business logic abuse patterns
-- JWT validation bypasses
-- API key and secret exposure
-- unsafe deserialization and object hydration paths
-- crypto weaknesses
-- sensitive data exposure in responses
-- cache poisoning risks
-- message queue risks
-- event stream risks
-
-## Installation
+## Install
 
 ```bash
 npm install
@@ -41,82 +30,307 @@ npm run build
 
 ## Quick start
 
-Run from source:
+### Code review (default mode)
 
 ```bash
-npm run dev -- --path ./src --output report.json
+# Default JSON report
+node dist/index.js --path ./src --output report.json
+
+# SARIF for GitHub code scanning
+node dist/index.js --path ./src --format sarif --output report.sarif
+
+# Show only critical findings; CI fails on the same threshold
+node dist/index.js --path ./src --min-severity CRITICAL --fail-on CRITICAL
+
+# Establish a baseline of currently-known findings; future scans suppress them
+node dist/index.js --update-baseline --baseline .security-baseline.json --path ./src
+
+# Subsequent scans drop everything in the baseline
+node dist/index.js --baseline .security-baseline.json --path ./src --format sarif --output report.sarif
 ```
 
-Run the compiled CLI:
+### Log review (Kibana / Elasticsearch)
 
 ```bash
-node dist/index.js --path ./src --format json --output report.json
-node dist/index.js --path ./src --format text --output report.txt
+# Credentials NEVER go on the command line. Use env vars or --password-stdin.
+export KIBANA_URL=https://kibana.bank.ae:5601
+export KIBANA_USERNAME=appsec-reader
+export CONTAINER_NAME=payments-svc
+
+# Recommended: read password from stdin (no bash history leak)
+echo -n "$KIBANA_PASSWORD" | node dist/index.js \
+  --mode logs \
+  --password-stdin \
+  --days 15 \
+  --log-index "filebeat-*" \
+  --format sarif --output payments-svc-15d.sarif
+
+# Alternative: KIBANA_PASSWORD env var
+KIBANA_PASSWORD=... node dist/index.js --mode logs --format json --output report.json
+
+# Direct ES transport (when Kibana proxy is unavailable)
+node dist/index.js --mode logs --transport direct --kibana-url https://es.bank.ae:9200 ...
+
+# Tighten the window for a quick smoke check
+node dist/index.js --mode logs --days 1 --max-hits 1000 --format text --output report.txt
 ```
 
-## CLI options
+Log-review inputs (flag → env var fallback):
 
-| Option | Alias | Description | Default |
+| Flag | Env var | Required | Notes |
 | --- | --- | --- | --- |
-| `--path` | `-p` | File or directory to analyze | `.` |
-| `--output` | `-o` | Report file path | `code-review-<timestamp>.json` |
-| `--format` | `-f` | Output format: `json` or `text` | `json` |
-| `--include-heuristics` | `-a` | Include lower-confidence findings in addition to the default exploit-focused set | `false` |
-| `--quiet` |  | Suppress non-error console output | `false` |
-| `--verbose` |  | Enable verbose console logging | `false` |
-| `--log-format` |  | Console log format: `text` or `json` | `text` |
-| `--fail-on-runtime-errors` |  | Return a non-zero exit code when runtime analysis errors occur | `true` |
+| `--kibana-url` / `--elasticsearch-url` | `KIBANA_URL` / `ELASTICSEARCH_URL` | yes | Base URL of Kibana or ES |
+| `--username` `-u` | `KIBANA_USERNAME` | yes | |
+| (stdin) `--password-stdin` | `KIBANA_PASSWORD` | yes | Plaintext CLI is **not** supported |
+| `--container` | `CONTAINER_NAME` | yes | Exact match |
+| `--container-field` | `CONTAINER_FIELD` | no | Default `kubernetes.container.name` |
+| `--log-index` | `LOG_INDEX` | no | Default `filebeat-*` |
+| `--days` | `LOG_REVIEW_DAYS` | no | Default 15, max 365 |
+| `--transport` | — | no | `kibana-proxy` (default) or `direct` |
+| `--max-hits` | — | no | Safety cap (default 50000) |
+| `--insecure` | — | no | Skip TLS verification (private CA only) |
 
-## Scan scope and defaults
+Log rules ship with PCI-DSS / UAE PDPL / OWASP-A09 mapping. The `--list-rules` output
+shows the full catalog including `LOG-*` rules with CWE references (CWE-532, CWE-359,
+CWE-256, etc.).
 
-- Broad directory scans analyze `.ts` and `.tsx` files.
-- Broad scans respect `.gitignore` and skip generated or non-target paths such as `node_modules/`, `dist/`, `coverage/`, `tests/`, `__tests__/`, `pocs/`, and `*.d.ts` files.
-- Explicit file and directory targets are still analyzed even when those paths would be skipped by a broad scan.
-- Default reports keep the exploit-focused subset of findings. Use `--include-heuristics` to include lower-confidence or defense-in-depth checks.
+## CLI
 
-## Exit behavior
+| Option | Description | Default |
+| --- | --- | --- |
+| `--path` `-p` | File or directory to analyze | `.` |
+| `--output` `-o` | Report file path | `code-review-<timestamp>.<ext>` |
+| `--format` `-f` | `json`, `text`, or `sarif` | `json` |
+| `--include-heuristics` `-a` | Include lower-confidence (heuristic) rules | `false` |
+| `--min-severity` | Drop findings below `CRITICAL|HIGH|MEDIUM|LOW|INFO` | severity-thresh `HIGH` by default, `LOW` with `--include-heuristics` |
+| `--fail-on` | Exit non-zero only when a finding of at least this severity remains | `HIGH` |
+| `--baseline <path>` | Suppress findings whose fingerprint is in this baseline | unset |
+| `--update-baseline` | Write current findings to `--baseline` path and exit `0` | `false` |
+| `--disable-rule <id>` | Drop findings for the named rule (repeatable; comma-separated) | unset |
+| `--show-suppressed` | Include suppressed findings in SARIF output for reviewer visibility | `false` |
+| `--list-rules` | Print the rule catalog (id, severity, CWE, OWASP) and exit | `false` |
+| `--quiet` / `--verbose` | Console verbosity | both `false` |
+| `--log-format` | Console log format (`text` or `json`) | `text` |
+| `--fail-on-runtime-errors` | Non-zero exit on parse/detector runtime errors | `true` |
 
-- Exit `0`: no findings and no blocking runtime issues
-- Exit `1`: findings detected, or runtime issues detected when `--fail-on-runtime-errors` is left enabled
+All console output goes to stderr so stdout is safe to pipe through `jq` etc.
 
-## Report output
+## Output: report shape
 
-JSON reports include:
+```jsonc
+{
+  "timestamp": "2026-05-29T...",
+  "filesAnalyzed": 12,
+  "totalFindings": 4,
+  "findingsByCategory": { "AUTHENTICATION": 2, "VALIDATION": 1, "..." },
+  "findingsBySeverity": { "CRITICAL": 2, "HIGH": 2, "..." },
+  "findings": [
+    {
+      "ruleId": "BCR-AUTH-002",
+      "category": "AUTHENTICATION",
+      "severity": "CRITICAL",
+      "title": "Hardcoded Secret/Token",
+      "file": "src/auth/keys.ts",
+      "line": 12,
+      "column": 7,
+      "code": "const JWT_SECRET = 'k7Hf91p2QvX8r4Lc2NaB3Tg5Y6Wm0Eu9'",
+      "recommendation": "...",
+      "fingerprint": "a1b2c3d4e5f60718",
+      "cwe": ["CWE-798", "CWE-259"],
+      "owasp": "A07:2021 - Identification and Authentication Failures"
+    }
+  ],
+  "runtimeIssues": [],
+  "hasRuntimeErrors": false
+}
+```
 
-- `timestamp`
-- `filesAnalyzed`
-- `totalFindings`
-- `findingsByCategory`
-- `findingsBySeverity`
-- `runtimeIssues`
-- `runtimeIssuesByType`
-- `hasRuntimeErrors`
-- `findings[]` with severity, category, location, description, code snippet, and recommendation
+## SARIF
 
-Text reports include the same core data in a human-readable summary.
+`--format sarif` emits a SARIF 2.1.0 document with:
 
-## Programmatic API and POCs
+- `tool.driver.rules[]` — full rule catalog from the registry (stable IDs)
+- `tool.driver.taxa[]` — CWE and OWASP taxonomies cross-referenced from each result
+- `results[].partialFingerprints["primaryLocationLineHash/v1"]` — content-addressed
+  fingerprint matching the baseline format. GitHub code scanning uses this for dedup.
+- `results[].suppressions[]` when `--show-suppressed` is enabled
+- `properties["security-severity"]` numeric (matches GitHub's severity column)
 
-Inside this repository, you can use the analyzer directly:
+This is the canonical format to consume from CI. Upload via
+[`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action) or your
+DefectDojo/Sonar SARIF ingest.
+
+## Suppression
+
+Two complementary mechanisms, both keyed on the finding's stable fingerprint.
+
+### Baseline (out-of-source)
+
+```bash
+# Snapshot current findings — commit this file
+node dist/index.js --update-baseline --baseline .security-baseline.json --path ./src
+
+# Subsequent runs ignore anything in the baseline
+node dist/index.js --baseline .security-baseline.json --path ./src
+```
+
+The baseline format (v1) persists only fingerprints — no source snippets — so it is
+safe to commit even when source contains real secrets:
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-05-29T00:00:00.000Z",
+  "entries": [
+    { "fingerprint": "a1b2c3d4e5f60718", "ruleId": "BCR-AUTH-002", "file": "src/auth/keys.ts" }
+  ]
+}
+```
+
+Fingerprints are computed from `ruleId + normalized-path + normalized-code` (whitespace
+collapsed), so adding/removing unrelated lines above the finding does not invalidate
+the baseline. This is the property AppSec teams need from a baseline: a triage decision
+shouldn't churn on every refactor.
+
+### Inline (in-source)
 
 ```ts
-import { BackendCodeReviewAnalyzer } from './src/analyzer';
+// bcr-disable-next-line BCR-AUTH-004 -- triaged 2026-05-29, key rotates monthly
+const JWT_SECRET = process.env.JWT_SECRET ?? FALLBACK;
 
-const analyzer = new BackendCodeReviewAnalyzer();
-const report = analyzer.analyze('./src');
-const pocs = analyzer.getPocs();
-
-analyzer.exportPocsAsMarkdown('./pocs');
-analyzer.generateComprehensivePocReport('./pocs/comprehensive-report.md', 'My Service');
+const X = 'value'; // bcr-disable-line BCR-AUTH-002 -- intentional test fixture
 ```
 
-POC exports are currently generated for supported exploit-ready findings from the authentication, validation, and mass-assignment detectors. The comprehensive markdown report combines compatible POCs, payload guidance, and remediation tasks into one shareable artifact.
+- Rule IDs are case-insensitive
+- Multiple rules: `// bcr-disable-next-line BCR-VAL-001,BCR-VAL-005 -- both apply`
+- All rules on the line: `// bcr-disable-line * -- reason`
+- The `-- reason` is required-in-spirit (surfaced in SARIF `suppressions[].justification`)
+  and strongly encouraged for audit
 
-## Stability notes
+## Rule catalog
 
-- Runtime problems are surfaced as structured report entries instead of silently disappearing.
-- Scan-scope rules and explicit-target behavior are covered by regression tests.
-- `npm run build` recreates `dist/` before compiling to avoid stale build artifacts.
+```bash
+node dist/index.js --list-rules
+```
+
+Every rule has a stable ID like `BCR-AUTH-002`. The ID is the contract: never renumbered,
+never renamed; deprecated rules stay listed with `deprecated: true` to preserve baseline
+stability.
+
+Rules are grouped into two confidence tiers:
+
+- **Default-on** rules emit by default — these are high-signal, low-FP patterns.
+- **Heuristic** rules (`heuristic: true`) emit only with `--include-heuristics`. They
+  capture broader patterns but have known false-positive shapes.
+
+## False-positive philosophy
+
+This scanner is tuned for **AppSec engineer review noise tolerance**, not academic
+recall. The defaults prefer false negatives over false positives. To widen recall:
+
+```bash
+node dist/index.js --path ./src --include-heuristics --min-severity LOW
+```
+
+The `tests/fpRegression.test.ts` suite pins the known FP shapes that the default
+configuration must never emit. Adding a detector tweak that regresses any of these
+patterns fails the build.
+
+## Coverage
+
+The default ruleset emits findings for:
+
+- **Authentication / JWT** — hardcoded secrets, missing signature verification,
+  algorithm-confusion (`alg:none`, RS256/HS256 key confusion), weak HMAC secret,
+  expiration-disabled, unverified token usage
+- **Injection** — SQL via interpolated strings (anchored to DB-shaped receivers),
+  command execution (`exec`/`spawn` plus alias resolution), `eval`/Function-constructor,
+  fs-sink path injection, **tagged-template SQL** (`` sql`SELECT ... ${tainted}` ``),
+  **prototype pollution** via JSON.parse / spread / Object.assign
+- **SSRF / Open Redirect** — outbound HTTP with user-controlled URL,
+  `res.redirect(req.X)` without allowlist
+- **Path Traversal** — filesystem sinks with user-controlled path, suppressed when the
+  enclosing scope shows a `path.resolve(BASE_DIR, …)` + `.startsWith(BASE_DIR)`
+  containment idiom
+- **Access Control** — missing auth/authz on sensitive endpoints (tightened from the
+  audit's overbroad version: requires both a credentialed-action handler AND mutation
+  evidence), BOLA / IDOR / horizontal escalation, privilege escalation (admin
+  functions touching request data without role check)
+- **Mass Assignment / Object Pollution** — `Object.assign(target, req.body)`, direct
+  spread of unvalidated input, prototype/`__proto__`/constructor assignment
+- **Rate Limiting** — header-bypass, weak limits, distributed (in-memory store)
+  bypass, missing limit on credential endpoints
+- **Crypto Weakness** — `md5`/`sha1` on passwords, `Math.random()` for tokens and
+  **identifiers/session ids/reset codes/OTPs/nonces** (new), hardcoded keys
+- **Secret Exposure** — service-specific patterns (Stripe, AWS, GitHub, Firebase,
+  SendGrid, Twilio), generic-name + entropy heuristic with HTTP-header-shape
+  exclusion, DB connection strings
+- **Logging** — secrets in log payloads (excluding plain string-literal labels),
+  log-injection via user input in templates
+- **Cache Poisoning, Queue, Event Stream** — see rule catalog
+- **Data Exposure** — sensitive fields in response shapes
+
+The new techniques the architecture adds:
+
+- **Scope-aware taint** with validator-aware detainting (zod / yup / joi / ajv /
+  class-validator / valibot / io-ts / typebox), recognising both bare functions and
+  schema `.parse()` / `.safeParse()` shapes
+- **Import-alias resolution** so `import { exec as runShell } from 'child_process'`
+  is still caught by command-execution rules even after rename
+- **Stable content fingerprints** (`sha256(ruleId + normalized-path + normalized-code)`)
+  so baselines and SARIF dedup don't churn on whitespace / line shifts
+- **CWE + OWASP taxa** cross-referenced from the SARIF tool driver — drops straight
+  into GitHub code scanning's filter UI
+
+## Limitations (honest)
+
+- **Single-file taint.** Cross-file flow is not tracked. A value tainted in `routes.ts`
+  and consumed in `db.ts` will not chain. The taint tracker uses scope-aware AST
+  identifier resolution within one source file (not the full TypeChecker), which keeps
+  setup zero-config but means it cannot follow imports.
+- **No symbol-table-level type information.** We do not run the TypeScript checker, so
+  rules cannot use type info to disambiguate. This is a deliberate trade — running the
+  checker requires per-project `tsconfig.json` discovery and is slow on large
+  monorepos. Detectors that would benefit (e.g. ORM-method recognition) instead use
+  conservative call-name + receiver patterns. The import-alias resolver handles the
+  most common case (renamed dangerous imports) without that infrastructure.
+- **Detection is intra-procedural.** Helpers that pass tainted values through are not
+  followed across call boundaries within the same file. This reduces recall but
+  eliminates a large class of FPs from heuristic propagation.
+- **POC layer is detection-coupled.** POC generation is currently driven from a fixed
+  set of detector types. Adding a rule does not automatically produce a POC.
+- **Zero-FP target is for the default mode.** The `--include-heuristics` mode runs
+  broader rules with known FP shapes — surface findings there to widen recall, gate
+  them out of CI failure via `--fail-on HIGH`. The FP audit corpus in
+  `tests/fixtures/fp-audit/` is the contract: any default-mode finding on a file in
+  that directory is a bug.
+
+## Determinism
+
+- Finding `fingerprint` is content-addressed (sha256 of ruleId + normalized path +
+  normalized code, truncated to 16 hex)
+- Findings are sorted `severity desc → file asc → line asc → ruleId asc` so reports
+  diff cleanly across runs
+- Console output goes to stderr; SARIF/JSON output is byte-stable for the same input
+
+## Exit codes
+
+- `0` — no findings at or above `--fail-on` severity, no blocking runtime errors
+- `1` — failing findings present, OR runtime errors when `--fail-on-runtime-errors` is on
+
+## CI: GitHub Actions example
+
+```yaml
+- name: Backend Code Review
+  run: |
+    node dist/index.js --path ./src --format sarif --output bcr.sarif \
+      --baseline .security-baseline.json \
+      --min-severity HIGH --fail-on HIGH
+
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: bcr.sarif
+```
 
 ## Development
 
@@ -125,13 +339,16 @@ npm run build
 npm test -- --runInBand
 ```
 
-## Limitations
+## Documentation
 
-- Static analysis only
-- Tuned for TypeScript backend code, not runtime traffic or live application behavior
-- Default reporting intentionally favors higher-signal findings over full coverage
-- Cross-file and inter-service semantic analysis is intentionally lightweight
+- [`docs/COMPLIANCE-MAPPING.md`](docs/COMPLIANCE-MAPPING.md) — every rule mapped to
+  PCI-DSS v4.0 / UAE PDPL / CBUAE CPS clauses, plus CWE references.
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — offline-install, CI integration
+  recipes for code + log modes, baseline workflow, performance numbers.
+- [`SECURITY.md`](SECURITY.md) — vulnerability disclosure policy + redaction
+  guarantee details.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history.
 
 ## License
 
-ISC
+[ISC](LICENSE).

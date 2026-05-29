@@ -10,6 +10,7 @@ import {
   isUserControlledExpression,
   RouteHandlerContext,
 } from '../utils/detectorLogic';
+import { computePocId } from '../rules/fingerprint';
 
 /**
  * Business Logic Flaw Detector
@@ -131,6 +132,7 @@ export class BusinessLogicDetector {
           const finding: Finding = {
             category: 'BUSINESS_LOGIC',
             severity: 'HIGH',
+            ruleId: 'BCR-BL-001',
             title: 'Potential Race Condition in Async Operations',
             description: 'Multiple async operations without transaction atomicity. Concurrent requests could interleave, causing inconsistent state.',
             file: this.filePath,
@@ -167,6 +169,7 @@ export class BusinessLogicDetector {
         {
           category: 'BUSINESS_LOGIC',
           severity: 'CRITICAL',
+          ruleId: 'BCR-BL-002',
           title: 'Missing Idempotency Key Validation',
           description: 'Payment/charge operation lacks idempotency key verification. Network retries could cause duplicate charges.',
           file: this.filePath,
@@ -213,6 +216,7 @@ export class BusinessLogicDetector {
           const finding: Finding = {
             category: 'BUSINESS_LOGIC',
             severity: 'HIGH',
+            ruleId: 'BCR-BL-003',
             title: 'Time-of-Check to Time-of-Use (TOCTOU) in Balance Verification',
             description: 'Balance check is performed, but the actual debit operation is not atomic. Another concurrent request could deplete funds between check and debit.',
             file: this.filePath,
@@ -253,6 +257,7 @@ export class BusinessLogicDetector {
         {
           category: 'BUSINESS_LOGIC',
           severity: 'CRITICAL',
+          ruleId: 'BCR-BL-004',
           title: 'Client-Controlled Price in Payment Operation',
           description: 'Price/amount for payment is taken from user request without server-side validation. Attacker can modify the amount.',
           file: this.filePath,
@@ -295,6 +300,7 @@ export class BusinessLogicDetector {
         {
           category: 'BUSINESS_LOGIC',
           severity: 'HIGH',
+          ruleId: 'BCR-BL-005',
           title: 'Inventory Over-Selling in Concurrent Purchases',
           description: 'Inventory is decremented without atomic verification. Multiple concurrent purchases could result in negative stock.',
           file: this.filePath,
@@ -476,7 +482,7 @@ export class BusinessLogicDetector {
    */
   private generateBusinessLogicPoc(finding: Finding, vulnerableCode: string, line: number): void {
     const poc: ProofOfConcept = {
-      id: `business-logic-${line}-${Date.now()}`,
+      id: computePocId('business-logic', this.filePath, line, vulnerableCode),
       title: finding.title,
       description: finding.description,
       vulnerabilityType: 'BUSINESS_LOGIC',

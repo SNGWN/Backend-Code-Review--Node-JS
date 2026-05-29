@@ -28,8 +28,88 @@ export class MassAssignmentDetector {
     this.detectMissingFieldWhitelisting();
     this.detectPrototypePollution();
     this.detectConstructorInjection();
+    this.detectMassAssignViaServiceCall();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * BCR-MA-006: `service.createUser(req.body)` / `Model.create(req.body)` shaped calls.
+   * This is the most idiomatic mass-assignment shape in real-world backends — far more
+   * common than `Object.assign(target, req.body)` — and was previously missed entirely.
+   *
+   * Precision controls (kept FP-low):
+   *   - The callee method name must look like a mutation (`create*`/`update*`/`save*`/`insert*`/`upsert*`/`register*`).
+   *   - The argument must be raw `req.body` / `request.body` / `ctx.request.body`
+   *     (NOT a destructured/picked alias, NOT a validated alias).
+   *   - The enclosing function must NOT show a validator (zod/joi/ajv/etc.) operating
+   *     on the request body — that's the actual exit criterion.
+   */
+  private detectMassAssignViaServiceCall(): void {
+    const allCalls = ASTVisitor.findCallExpressions(this.sourceFile);
+    allCalls.forEach((call) => {
+      const callee = call.expression;
+      if (!ts.isPropertyAccessExpression(callee)) return;
+
+      const methodName = callee.name.text;
+      if (!/^(create|update|save|insert|upsert|register|new)([A-Z]|$)/.test(methodName)) {
+        return;
+      }
+
+      // Receiver must look like a service / model / repository — not bare globals.
+      const receiverName = ts.isIdentifier(callee.expression)
+        ? callee.expression.text
+        : callee.expression.getText(this.sourceFile);
+      if (!/(service|repo|repository|model|dao|store|client|controller|resource|entity)$/i.test(receiverName) && !/^[A-Z][A-Za-z]*$/.test(receiverName.split('.').pop() ?? '')) {
+        return;
+      }
+
+      // Find any argument that IS req.body / request.body / ctx.request.body.
+      const rawBodyArg = call.arguments.find((arg) => {
+        const text = arg.getText(this.sourceFile);
+        return /^(req|request)\.body$|^ctx\.request\.body$/.test(text.trim());
+      });
+      if (!rawBodyArg) return;
+
+      // If the enclosing function shows a validator, the body was likely sanitized.
+      const enclosing = this.getEnclosingFunctionText(call);
+      if (/\b(joi|yup|zod|valibot|ajv|class-?validator|express[-_]?validator|safe[-_]?parse|sanitize)\b/i.test(enclosing)) {
+        return;
+      }
+      // Or explicit destructure: `const { allowed } = req.body; service.create({ allowed })`.
+      if (/const\s*\{[^}]+\}\s*=\s*(req|request)\.body/.test(enclosing)) return;
+      if (/\b(pick|omit|extract)\s*\(/i.test(enclosing)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      this.findings.push({
+        ruleId: 'BCR-MA-006',
+        category: 'MASS_ASSIGNMENT',
+        severity: 'HIGH',
+        title: 'Mass Assignment via Service Call With req.body',
+        description: `\`${receiverName}.${methodName}\` receives raw request body without a visible schema validation in the enclosing scope. Attacker-controlled fields like role/isAdmin/verified will flow into the model.`,
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 140),
+        recommendation: 'Validate the body through joi/zod/class-validator or pick allowed fields explicitly before passing to the service call.',
+      });
+    });
+  }
+
+  private getEnclosingFunctionText(node: ts.Node): string {
+    let current: ts.Node | undefined = node;
+    while (current) {
+      if (
+        ts.isFunctionDeclaration(current) ||
+        ts.isFunctionExpression(current) ||
+        ts.isArrowFunction(current) ||
+        ts.isMethodDeclaration(current)
+      ) {
+        return current.getText(this.sourceFile);
+      }
+      current = current.parent;
+    }
+    return node.getText(this.sourceFile);
   }
 
   private detectDirectObjectAssign(): void {
@@ -52,6 +132,7 @@ export class MassAssignmentDetector {
         ) {
           const { line, column } = this.parser.getLineAndColumn(call.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-MA-001',
             category: 'MASS_ASSIGNMENT',
             severity: 'CRITICAL',
             title: 'Direct Object.assign with User Input',
@@ -94,6 +175,7 @@ export class MassAssignmentDetector {
       ) {
         const { line, column } = this.parser.getLineAndColumn(binExpr.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-MA-002',
           category: 'MASS_ASSIGNMENT',
           severity: 'HIGH',
           title: 'Unvalidated Field Assignment',
@@ -137,6 +219,7 @@ export class MassAssignmentDetector {
       if (hasDirectAssignment && !hasWhitelist) {
         const { line, column } = this.parser.getLineAndColumn(func.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-MA-003',
           category: 'MASS_ASSIGNMENT',
           severity: 'MEDIUM',
           title: 'Missing Field Whitelisting',
@@ -177,6 +260,7 @@ export class MassAssignmentDetector {
       ) {
         const { line, column } = this.parser.getLineAndColumn(binExpr.getStart());
         const finding: Finding = {
+          ruleId: 'BCR-MA-004',
           category: 'MASS_ASSIGNMENT',
           severity: 'CRITICAL',
           title: 'Prototype Pollution Vulnerability',
@@ -217,6 +301,7 @@ export class MassAssignmentDetector {
         ) {
           const { line, column } = this.parser.getLineAndColumn(node.getStart());
           const finding: Finding = {
+            ruleId: 'BCR-MA-005',
             category: 'MASS_ASSIGNMENT',
             severity: 'CRITICAL',
             title: 'Constructor/Prototype Property Assignment',

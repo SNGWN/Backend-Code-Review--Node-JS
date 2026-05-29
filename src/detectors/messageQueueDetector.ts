@@ -4,8 +4,8 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 
 /**
- * Message Queue Vulnerability Detector (Phase 3)
- * 
+ * Message Queue Vulnerability Detector
+ *
  * Detects message queue exploitation patterns:
  * - Unvalidated deserialization of queue messages
  * - Queue message tampering without verification
@@ -50,6 +50,7 @@ export class MessageQueueDetector {
       file: this.filePath,
       line: lineNum,
       column: 0,
+      ruleId: 'BCR-MQ-001',
       severity: 'CRITICAL',
       category: 'MESSAGE_QUEUE',
       title: 'Exploitable Queue Consumer Deserialization',
@@ -77,6 +78,7 @@ export class MessageQueueDetector {
       file: this.filePath,
       line: lineNum,
       column: 0,
+      ruleId: 'BCR-MQ-002',
       severity: 'HIGH',
       category: 'MESSAGE_QUEUE',
       title: 'Unsigned Queue Publish with User-Controlled Payload',
@@ -104,6 +106,7 @@ export class MessageQueueDetector {
       file: this.filePath,
       line: lineNum,
       column: 0,
+      ruleId: 'BCR-MQ-003',
       severity: 'HIGH',
       category: 'MESSAGE_QUEUE',
       title: 'Queue Message Integrity Not Verified Before Ack',

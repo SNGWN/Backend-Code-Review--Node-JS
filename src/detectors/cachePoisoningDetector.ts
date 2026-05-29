@@ -4,8 +4,8 @@ import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
 
 /**
- * Cache Poisoning Detector (Phase 3)
- * 
+ * Cache Poisoning Detector
+ *
  * Detects cache poisoning vulnerabilities in microservices:
  * - Caching user-controlled input without validation
  * - Using request headers as cache keys (Host, Referer, X-Forwarded-For)
@@ -54,6 +54,7 @@ export class CachePoisoningDetector {
     );
 
     this.findings.push({
+      ruleId: headerPoisoning ? 'BCR-CACHE-002' : 'BCR-CACHE-001',
       file: this.filePath,
       line: lineNum,
       column: 0,

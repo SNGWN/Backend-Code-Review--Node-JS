@@ -22,6 +22,14 @@ export class JSONReporter {
       CACHE_POISONING: 0,
       MESSAGE_QUEUE: 0,
       EVENT_STREAM: 0,
+      SSRF: 0,
+      PATH_TRAVERSAL: 0,
+      OPEN_REDIRECT: 0,
+      MISCONFIGURATION: 0,
+      LOG_PCI: 0,
+      LOG_PII: 0,
+      LOG_SECRET: 0,
+      LOG_OPS: 0,
     };
     const runtimeIssuesByType: Record<RuntimeIssueType, number> = {
       INVALID_TARGET: 0,
@@ -54,10 +62,11 @@ export class JSONReporter {
       totalFindings: findings.length,
       findingsByCategory,
       findingsBySeverity,
-      findings: findings.sort((a, b) => {
-        const severityOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 };
-        return severityOrder[a.severity] - severityOrder[b.severity];
-      }),
+      // Trust the caller's ordering — `analyzer.getReportFindings()` already sorts
+      // deterministically (severity desc, file asc, line asc, ruleId asc) and we
+      // must not clobber that. Previously this re-sorted ascending AND mutated the
+      // shared array, breaking analyzer determinism and aliasing the input.
+      findings: [...findings],
       runtimeIssues,
       runtimeIssuesByType,
       hasRuntimeErrors: runtimeIssues.some((issue) => issue.severity === 'ERROR'),

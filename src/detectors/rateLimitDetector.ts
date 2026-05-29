@@ -74,6 +74,7 @@ export class RateLimitDetector {
     routes.forEach((route) => {
       if (this.isSensitiveEndpoint(route.path) && !hasRateLimitProtection(route, this.sourceFile)) {
         this.findings.push({
+            ruleId: 'BCR-RL-001',
             category: 'RATE_LIMITING',
             severity: 'HIGH',
             title: `Missing Rate Limiting on Sensitive Endpoint: ${route.path}`,
@@ -105,6 +106,7 @@ export class RateLimitDetector {
 
         if (config.usesReqIpKey && !config.hasTrustedProxyProtection) {
           this.findings.push({
+            ruleId: 'BCR-RL-002',
             category: 'RATE_LIMITING',
             severity: 'HIGH',
             title: 'Rate Limit Bypass via Header Manipulation',
@@ -149,6 +151,7 @@ export class RateLimitDetector {
         const requestsPerMinute = (config.maxRequests * 60000) / config.windowMs;
         if (requestsPerMinute > 10) {
           this.findings.push({
+            ruleId: 'BCR-RL-003',
             category: 'RATE_LIMITING',
             severity: 'HIGH',
             title: 'Weak Rate Limiting on Sensitive Endpoint',
@@ -180,6 +183,7 @@ export class RateLimitDetector {
         const config = resolveRateLimitConfig(middleware, this.sourceFile);
         if (config?.usesMemoryStore && !config.usesDistributedStore) {
           this.findings.push({
+            ruleId: 'BCR-RL-004',
             category: 'RATE_LIMITING',
             severity: 'HIGH',
             title: 'Distributed Rate Limit Bypass via Load Balancer',
@@ -214,16 +218,10 @@ export class RateLimitDetector {
   }
 
   /**
-   * Generate POC for missing rate limiting
+   * Reserved hook for rate-limit POC generation. Intentionally empty — the rate-limit
+   * detector emits structured findings that the standalone PocPipeline (when wired)
+   * can consume by ruleId without per-detector POC code.
    */
-  private generateMissingRateLimitPoc(_endpoint: string, _line: number): void {
-    // POC generation coming in Phase 2 POC templates
-  }
-
-  /**
-   * Generate POC for header bypass
-   */
-  private generateHeaderBypassPoc(_line: number): void {
-    // POC generation coming in Phase 2 POC templates
-  }
+  private generateMissingRateLimitPoc(_endpoint: string, _line: number): void { /* noop */ }
+  private generateHeaderBypassPoc(_line: number): void { /* noop */ }
 }
