@@ -296,6 +296,18 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
   }
 }
 
+/**
+ * Bank-compliance masking for the CLI banner. Mirrors the redaction in
+ * SearchAnalyzer so the banner doesn't leak PAN / Emirates-ID / Bearer values
+ * the user passed via `--query`.
+ */
+function maskCliQuery(query: string): string {
+  return query.replace(/("[^"]+"|[^\s()]{4,})/g, (token) => {
+    if (token.length <= 4) return '*'.repeat(token.length);
+    return token.slice(0, 2) + '*'.repeat(token.length - 4) + token.slice(-2);
+  });
+}
+
 function parseMode(value: unknown): RunMode {
   const normalized = String(value || 'code').toLowerCase();
   if (!(VALID_MODES as string[]).includes(normalized)) {
@@ -508,7 +520,10 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
 ╚═════════════════════════════════════════════╝
 `);
   Logger.info(`📡 Kibana: ${kibanaUrl}  (transport: ${transport})`);
-  Logger.info(`🔎 Query : ${query}`);
+  // Mask the query banner so PAN / Emirates-ID / Bearer leaks in the user's own
+  // search term don't end up in stdout/CI capture. The user already knows what
+  // they searched; reviewers reading the artifact don't need the raw value.
+  Logger.info(`🔎 Query : ${maskCliQuery(query)}`);
   Logger.info(`📂 Index : ${logIndex}${container ? `  Container: ${container}` : '  Container: (all)'}`);
   Logger.info(`⏱  Window: last ${days} days  (max ${maxHits} hits)\n`);
 

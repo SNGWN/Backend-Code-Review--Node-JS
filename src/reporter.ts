@@ -48,9 +48,12 @@ export class JSONReporter {
       INFO: 0,
     };
 
+    const findingsByRule: Record<string, number> = {};
     findings.forEach((finding) => {
       findingsByCategory[finding.category]++;
       findingsBySeverity[finding.severity]++;
+      const id = finding.ruleId ?? `LEGACY:${finding.category}`;
+      findingsByRule[id] = (findingsByRule[id] ?? 0) + 1;
     });
     runtimeIssues.forEach((issue) => {
       runtimeIssuesByType[issue.type]++;
@@ -62,6 +65,7 @@ export class JSONReporter {
       totalFindings: findings.length,
       findingsByCategory,
       findingsBySeverity,
+      findingsByRule,
       // Trust the caller's ordering — `analyzer.getReportFindings()` already sorts
       // deterministically (severity desc, file asc, line asc, ruleId asc) and we
       // must not clobber that. Previously this re-sorted ascending AND mutated the

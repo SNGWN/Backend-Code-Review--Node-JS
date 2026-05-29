@@ -100,6 +100,11 @@ export interface AnalysisReport {
   totalFindings: number;
   findingsByCategory: Record<IssueCategory, number>;
   findingsBySeverity: Record<Severity, number>;
+  /**
+   * Per-rule firing counts. PCI-DSS Req 10 evidence asks for "how many findings
+   * per rule" cross-referenced with the rule catalog — this is the answer.
+   */
+  findingsByRule: Record<string, number>;
   findings: Finding[];
   runtimeIssues: RuntimeIssue[];
   runtimeIssuesByType: Record<RuntimeIssueType, number>;

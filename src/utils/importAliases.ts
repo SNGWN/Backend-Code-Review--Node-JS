@@ -90,6 +90,60 @@ export function buildImportAliasMap(sourceFile: ts.SourceFile): Map<string, Impo
 }
 
 /**
+ * Re-export descriptor: `export { exec } from 'child_process'` or `export * from './a'`.
+ * Used by the project-context cross-file resolver to follow re-export chains so that
+ * an aliased re-export of a dangerous import still resolves to the canonical name.
+ */
+export interface ReExport {
+  /** Local exported name (what the consuming module imports). */
+  exportedName: string;
+  /** The upstream module specifier. */
+  fromModule: string;
+  /** The name in the upstream module (`'*'` for re-export-all). */
+  upstreamName: string;
+}
+
+/**
+ * Walks `ExportDeclaration` nodes and returns their re-export descriptors. This
+ * complements `buildImportAliasMap` for the export side; together they let the
+ * project context follow taint or dangerous-API references across re-export chains.
+ *
+ * Handles:
+ *   - `export { exec } from 'child_process';`
+ *   - `export { exec as runShell } from 'child_process';`
+ *   - `export * from './shared';`
+ *   - `export * as utils from './utils';`  (namespace re-export)
+ */
+export function buildReExportList(sourceFile: ts.SourceFile): ReExport[] {
+  const out: ReExport[] = [];
+  for (const statement of sourceFile.statements) {
+    if (!ts.isExportDeclaration(statement)) continue;
+    const moduleSpecifier = statement.moduleSpecifier;
+    if (!moduleSpecifier || !ts.isStringLiteral(moduleSpecifier)) continue;
+    const fromModule = moduleSpecifier.text;
+    const clause = statement.exportClause;
+    if (!clause) {
+      // `export * from './shared'` — re-export-all.
+      out.push({ exportedName: '*', fromModule, upstreamName: '*' });
+      continue;
+    }
+    if (ts.isNamespaceExport(clause)) {
+      // `export * as utils from './utils'`
+      out.push({ exportedName: clause.name.text, fromModule, upstreamName: '*' });
+      continue;
+    }
+    if (ts.isNamedExports(clause)) {
+      for (const element of clause.elements) {
+        const exportedName = element.name.text;
+        const upstreamName = element.propertyName ? element.propertyName.text : exportedName;
+        out.push({ exportedName, fromModule, upstreamName });
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Given a call expression and an alias map, return the canonical exported name of the
  * callee — useful for "is this really `exec`, or `path.join`, regardless of local name?"
  *

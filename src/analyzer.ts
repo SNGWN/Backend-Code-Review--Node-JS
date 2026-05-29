@@ -34,6 +34,7 @@ import { Logger } from './utils/logger';
 import { getRule, isHeuristic, severityAtLeast, severityRank } from './rules/registry';
 import { computeFingerprint, normalizePath } from './rules/fingerprint';
 import { Baseline, buildInlineSuppressions, isLineSuppressed } from './rules/baseline';
+import { ProjectContext } from './utils/projectContext';
 
 interface DetectorWithPocs {
   detect(): DetectorResult;
@@ -46,7 +47,8 @@ interface DetectorFactory {
   create: (
     filePath: string,
     sourceFile: ts.SourceFile,
-    parser: ASTParser
+    parser: ASTParser,
+    projectContext: ProjectContext | null
   ) => DetectorWithPocs;
 }
 
@@ -104,74 +106,81 @@ export class BackendCodeReviewAnalyzer {
    */
   private inlineSuppressionByFile = new Map<string, Map<number, ReturnType<typeof buildInlineSuppressions> extends Map<number, infer V> ? V : never>>();
   private baseline: Baseline | null = null;
+  /**
+   * Cross-file project context — populated for directory scans only. Carries
+   * import/re-export graph + per-exported-function summaries so detectors can
+   * resolve aliased re-exports of dangerous APIs and detect tainted return values
+   * from exported helper functions. Null for single-file scans.
+   */
+  private projectContext: ProjectContext | null = null;
   private detectorFactories: DetectorFactory[] = [
     {
       name: 'AuthenticationDetector',
-      create: (filePath, sourceFile, parser) => new AuthenticationDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new AuthenticationDetector(filePath, sourceFile, parser),
     },
     {
       name: 'ParameterValidationDetector',
-      create: (filePath, sourceFile, parser) => new ParameterValidationDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, pc) => new ParameterValidationDetector(filePath, sourceFile, parser, pc),
     },
     {
       name: 'LogReviewDetector',
-      create: (filePath, sourceFile, parser) => new LogReviewDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new LogReviewDetector(filePath, sourceFile, parser),
     },
     {
       name: 'MassAssignmentDetector',
-      create: (filePath, sourceFile, parser) => new MassAssignmentDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new MassAssignmentDetector(filePath, sourceFile, parser),
     },
     {
       name: 'RateLimitDetector',
-      create: (filePath, sourceFile, parser) => new RateLimitDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new RateLimitDetector(filePath, sourceFile, parser),
     },
     {
       name: 'AccessControlDetector',
-      create: (filePath, sourceFile, parser) => new AccessControlDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new AccessControlDetector(filePath, sourceFile, parser),
     },
     {
       name: 'BusinessLogicDetector',
-      create: (filePath, sourceFile, parser) => new BusinessLogicDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new BusinessLogicDetector(filePath, sourceFile, parser),
     },
     {
       name: 'JwtBypassDetector',
-      create: (filePath, sourceFile, parser) => new JwtBypassDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new JwtBypassDetector(filePath, sourceFile, parser),
     },
     {
       name: 'ApiKeyDetector',
-      create: (filePath, sourceFile, parser) => new ApiKeyDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new ApiKeyDetector(filePath, sourceFile, parser),
     },
     {
       name: 'DeserializationDetector',
-      create: (filePath, sourceFile, parser) => new DeserializationDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new DeserializationDetector(filePath, sourceFile, parser),
     },
     {
       name: 'CryptoWeaknessDetector',
-      create: (filePath, sourceFile, parser) => new CryptoWeaknessDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new CryptoWeaknessDetector(filePath, sourceFile, parser),
     },
     {
       name: 'DataExposureDetector',
-      create: (filePath, sourceFile, parser) => new DataExposureDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new DataExposureDetector(filePath, sourceFile, parser),
     },
     {
       name: 'CachePoisoningDetector',
-      create: (filePath, sourceFile, parser) => new CachePoisoningDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new CachePoisoningDetector(filePath, sourceFile, parser),
     },
     {
       name: 'MessageQueueDetector',
-      create: (filePath, sourceFile, parser) => new MessageQueueDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new MessageQueueDetector(filePath, sourceFile, parser),
     },
     {
       name: 'EventStreamDetector',
-      create: (filePath, sourceFile, parser) => new EventStreamDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new EventStreamDetector(filePath, sourceFile, parser),
     },
     {
       name: 'SsrfDetector',
-      create: (filePath, sourceFile, parser) => new SsrfDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, pc) => new SsrfDetector(filePath, sourceFile, parser, pc),
     },
     {
       name: 'MisconfigurationDetector',
-      create: (filePath, sourceFile, parser) => new MisconfigurationDetector(filePath, sourceFile, parser),
+      create: (filePath, sourceFile, parser, _pc) => new MisconfigurationDetector(filePath, sourceFile, parser),
     },
   ];
 
@@ -200,6 +209,21 @@ export class BackendCodeReviewAnalyzer {
       }
 
       Logger.info(`📁 Found ${files.length} TypeScript files to analyze...`);
+
+      // Two-pass analysis for cross-file taint. Skip the pre-pass for single-file
+      // targets (no other modules to resolve against) — saves the AST walk.
+      if (files.length > 1) {
+        this.projectContext = new ProjectContext();
+        for (const filePath of files) {
+          try {
+            const parser = new ASTParser(filePath);
+            const sourceFile = parser.parse();
+            if (sourceFile) this.projectContext.addFile(filePath, sourceFile);
+          } catch {
+            /* per-file parse failure handled in analyzeFile() below */
+          }
+        }
+      }
 
       for (const filePath of files) {
         this.analyzeFile(filePath);
@@ -306,6 +330,16 @@ export class BackendCodeReviewAnalyzer {
     this.runtimeIssues = [];
     this.inlineSuppressionByFile.clear();
     this.baseline = null;
+    this.projectContext = null;
+  }
+
+  /**
+   * Returns the cross-file ProjectContext for the current scan, when one is built.
+   * Detectors call this from their constructor or `detect()` to opt into cross-file
+   * resolution (re-exported dangerous APIs, tainted-return-via-imported-helper, etc.).
+   */
+  getProjectContext(): ProjectContext | null {
+    return this.projectContext;
   }
 
   private getTargetFiles(targetPath: string): string[] {
@@ -360,7 +394,7 @@ export class BackendCodeReviewAnalyzer {
 
     for (const detectorFactory of this.detectorFactories) {
       try {
-        const detector = detectorFactory.create(filePath, sourceFile, parser);
+        const detector = detectorFactory.create(filePath, sourceFile, parser, this.projectContext);
         const result = detector.detect();
         this.findings.push(...result.findings);
         this.generatedPocs.push(...this.extractPocs(detector));

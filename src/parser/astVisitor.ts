@@ -3,16 +3,30 @@ import * as ts from 'typescript';
 export type NodeVisitor<T = void> = (node: ts.Node) => T | undefined;
 
 export class ASTVisitor {
+  /**
+   * Iterative pre-order traversal. The previous implementation recursed via
+   * `ts.forEachChild` and overflowed the JS call stack on deeply-nested ASTs
+   * (e.g. 5000-deep ternary expressions, deeply chained method calls). The
+   * iterative version uses a work stack and a child-collection helper, so depth
+   * is bounded by heap rather than stack.
+   */
   static visit(node: ts.Node, visitor: NodeVisitor): void {
-    visitor(node);
-    ts.forEachChild(node, (child) => {
-      ASTVisitor.visit(child, visitor);
-    });
+    const stack: ts.Node[] = [node];
+    while (stack.length > 0) {
+      const current = stack.pop() as ts.Node;
+      visitor(current);
+      // Collect children, then push in reverse order to preserve pre-order semantics
+      // (left-to-right child visit order). `forEachChild` itself is non-recursive at
+      // the immediate-child level — it's the recursion in our visit() that overflowed.
+      const children: ts.Node[] = [];
+      ts.forEachChild(current, (child) => { children.push(child); });
+      for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+    }
   }
 
   static visitAll(node: ts.Node, visitor: NodeVisitor): ts.Node[] {
     const results: ts.Node[] = [];
-    
+
     ASTVisitor.visit(node, (child) => {
       const result = visitor(child);
       if (result !== undefined) {
@@ -25,15 +39,17 @@ export class ASTVisitor {
 
   static findNodes(node: ts.Node, predicate: (n: ts.Node) => boolean): ts.Node[] {
     const results: ts.Node[] = [];
-
-    const walk = (node: ts.Node) => {
-      if (predicate(node)) {
-        results.push(node);
+    // Iterative walk (same reasoning as `visit`).
+    const stack: ts.Node[] = [node];
+    while (stack.length > 0) {
+      const current = stack.pop() as ts.Node;
+      if (predicate(current)) {
+        results.push(current);
       }
-      ts.forEachChild(node, walk);
-    };
-
-    walk(node);
+      const children: ts.Node[] = [];
+      ts.forEachChild(current, (child) => { children.push(child); });
+      for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+    }
     return results;
   }
 

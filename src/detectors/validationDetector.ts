@@ -12,6 +12,7 @@ import {
 } from '../utils/detectorLogic';
 import { TaintTracker } from '../utils/taint';
 import { buildImportAliasMap, ImportAlias, resolveCalleeToExportedName } from '../utils/importAliases';
+import { ProjectContext } from '../utils/projectContext';
 
 /**
  * Parameter Validation Detector
@@ -42,16 +43,23 @@ export class ParameterValidationDetector {
   private taintedVariables = new Set<string>();
   private taintTracker: TaintTracker | null = null;
   private aliasMap: Map<string, ImportAlias> = new Map();
+  private projectContext: ProjectContext | null = null;
 
   /**
    * POC Generator for injection vulnerabilities
    */
   private pocGenerator: InjectionPocGenerator = new InjectionPocGenerator();
 
-  constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
+  constructor(
+    filePath: string,
+    sourceFile: ts.SourceFile,
+    parser: ASTParser,
+    projectContext: ProjectContext | null = null
+  ) {
     this.filePath = filePath;
     this.sourceFile = sourceFile;
     this.parser = parser;
+    this.projectContext = projectContext;
   }
 
   /**
@@ -226,7 +234,17 @@ export class ParameterValidationDetector {
     const localCallName = ASTVisitor.getCallExpressionName(callExpr) || callExpr.expression.getText();
     // Resolve renamed imports — `import { exec as runShell } from 'child_process'`
     // should still match dangerous-API rules even though the local name is `runShell`.
-    const resolvedExportedName = resolveCalleeToExportedName(callExpr, this.aliasMap)?.exportedName;
+    let resolvedExportedName = resolveCalleeToExportedName(callExpr, this.aliasMap)?.exportedName;
+    // Cross-file resolution: follow re-export chains through project files. Closes the
+    // F3/F4 cross-file vulnerability shapes (e.g. `export { exec } from 'child_process'`
+    // smuggled through a barrel file).
+    if (this.projectContext) {
+      const xfile = this.projectContext.callResolvesToDangerousBuiltin(this.filePath, callExpr);
+      if (xfile) {
+        // Override with the canonical resolved name so the existing pattern match fires.
+        resolvedExportedName = xfile.name;
+      }
+    }
     const callName = resolvedExportedName ?? localCallName;
     // Anchor the SQL-call name to exact dangerous patterns instead of substring matches —
     // avoids "executeMigration", "rawValue", "userQuery" etc.
@@ -348,6 +366,25 @@ export class ParameterValidationDetector {
         }
       }
       return true;
+    }
+
+    // Cross-file: walk the node and look for any call expression that resolves
+    // (across project re-exports) to an imported helper whose return value derives
+    // from a user-controlled source. Covers `\`…${getId(req)}…\`` where `getId`
+    // lives in another file and reads `req.params.id`.
+    if (this.projectContext) {
+      let xfileTainted = false;
+      const pc = this.projectContext;
+      const walk = (n: ts.Node): void => {
+        if (xfileTainted) return;
+        if (ts.isCallExpression(n) && pc.callReturnsTaintedFromRequest(this.filePath, n)) {
+          xfileTainted = true;
+          return;
+        }
+        n.forEachChild(walk);
+      };
+      walk(node);
+      if (xfileTainted) return true;
     }
 
     return isUntrustedInputText(node.getText());

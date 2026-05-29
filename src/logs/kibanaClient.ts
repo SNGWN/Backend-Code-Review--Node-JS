@@ -364,12 +364,23 @@ export class KibanaClient {
 
     const { status, body: respBody } = await this.requestWithRetry('POST', url, body);
     if (status < 200 || status >= 300) {
+      // Surface the most common operational error shapes specifically.
+      if (status === 404 && /index_not_found_exception/.test(respBody)) {
+        throw new Error(`Index pattern '${this.index}' not found in Elasticsearch. Use --log-index or verify in Kibana index management.`);
+      }
+      if (status === 401 || status === 403) {
+        throw new Error(`Elasticsearch auth ${status === 401 ? 'failed' : 'forbidden'} (HTTP ${status}). Verify credentials and index read permissions.`);
+      }
       throw new Error(`Elasticsearch search failed: HTTP ${status} ${scrubCredentialsFromUrl(truncate(respBody, 500))}`);
     }
     try {
       return JSON.parse(respBody);
     } catch (error) {
-      throw new Error(`Elasticsearch response was not JSON: ${(error as Error).message}`);
+      // A 200 OK with non-JSON body is usually an upstream LB or proxy serving an
+      // HTML error page in front of Kibana. Surface the body prefix so the operator
+      // can diagnose which hop returned it.
+      const preview = scrubCredentialsFromUrl(truncate(respBody.trim(), 200));
+      throw new Error(`Elasticsearch returned HTTP 200 with non-JSON body (likely an upstream proxy/LB error page). First 200 bytes: ${preview}`);
     }
   }
 

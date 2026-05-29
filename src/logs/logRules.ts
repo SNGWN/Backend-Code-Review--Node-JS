@@ -1062,6 +1062,119 @@ export const ruleLogGenericHighEntropySecret: LogRule = (line) => {
   return out;
 };
 
+// ── Coverage expansion (1.2) ─────────────────────────────────────────────────
+
+/** LOG-SEC-015: HTTP Basic-auth header `Authorization: Basic <base64>`. */
+export const ruleLogBasicAuth: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const pattern = /\bAuthorization\s*[:=]\s*"?Basic\s+([A-Za-z0-9+/=]{16,})/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-SEC-002', 'Bearer token or JWT in log message',
+      'An `Authorization: Basic …` header appears in this log line; base64-decoded value is `user:password`.',
+      'Strip Authorization headers in the logging middleware; rotate exposed credentials.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[1]));
+  }
+  return out;
+};
+
+/** LOG-SEC-016: Slack / Discord / MS Teams webhook URLs. */
+export const ruleLogWebhookUrls: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const patterns: Array<{ name: string; pattern: RegExp }> = [
+    { name: 'Slack', pattern: /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{8,}\/B[A-Z0-9]{8,}\/[A-Za-z0-9]{20,}/g },
+    { name: 'Discord', pattern: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_\-]{24,}/g },
+    { name: 'MS Teams', pattern: /https:\/\/[^\s"']+\.webhook\.office\.com\/webhookb2\/[a-f0-9-]+@[a-f0-9-]+\/IncomingWebhook\/[A-Za-z0-9]+/g },
+  ];
+  for (const { name, pattern } of patterns) {
+    const fresh = new RegExp(pattern.source, pattern.flags);
+    let m: RegExpExecArray | null;
+    while ((m = fresh.exec(line)) !== null) {
+      out.push(buildMatch('LOG-SEC-003', `${name} webhook URL in log message`,
+        `A ${name} incoming-webhook URL appears in this log line.`,
+        `Rotate the webhook and configure a Slack/Discord/Teams App secret instead.`,
+        'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+    }
+  }
+  return out;
+};
+
+/** LOG-SEC-017: GitHub fine-grained PATs + npm tokens (additions to service-key set). */
+export const ruleLogServiceKeysExtra: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  const patterns: Array<{ name: string; pattern: RegExp }> = [
+    { name: 'GitHub fine-grained PAT', pattern: /\bgithub_pat_[A-Za-z0-9_]{82}\b/g },
+    { name: 'npm token', pattern: /\bnpm_[A-Za-z0-9]{36}\b/g },
+    { name: 'OpenAI key', pattern: /\bsk-[A-Za-z0-9]{20,}T3BlbkFJ[A-Za-z0-9]{20,}\b/g },
+    { name: 'Heroku API key', pattern: /\bhe[ks]u_[A-Za-z0-9_-]{36,}\b/g },
+  ];
+  for (const { name, pattern } of patterns) {
+    const fresh = new RegExp(pattern.source, pattern.flags);
+    let m: RegExpExecArray | null;
+    while ((m = fresh.exec(line)) !== null) {
+      out.push(buildMatch('LOG-SEC-003', `${name} in log message`,
+        `A ${name} pattern appears in this log line.`,
+        `Rotate the key; add a redaction filter to the logger.`,
+        'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+    }
+  }
+  return out;
+};
+
+/** LOG-SEC-018: AWS / GCP / Cloudflare presigned URLs. */
+export const ruleLogPresignedUrl: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // AWS S3 SigV4 presigned URL signatures
+  const patterns: RegExp[] = [
+    /X-Amz-Signature=[A-Fa-f0-9]{32,}/g,
+    /X-Goog-Signature=[A-Fa-f0-9]{32,}/g,
+    /\bsig=[A-Za-z0-9%+/=_-]{20,}&se=\d/g,
+  ];
+  for (const pattern of patterns) {
+    const fresh = new RegExp(pattern.source, pattern.flags);
+    let m: RegExpExecArray | null;
+    while ((m = fresh.exec(line)) !== null) {
+      out.push(buildMatch('LOG-SEC-003', 'Cloud-storage presigned URL in log message',
+        'A cloud-storage signed URL (S3 / GCS / Azure / Cloudflare) appears in this log line.',
+        'Presigned URLs grant scoped access until expiry — rotate or invalidate by changing the underlying secret/key.',
+        'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[0]));
+    }
+  }
+  return out;
+};
+
+/** LOG-PII-009: US Social Security Number. */
+export const ruleLogUsSsn: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Valid SSN: area 001-665 or 667-899 (skip 666, 000, 9xx); group 01-99; serial 0001-9999.
+  const pattern = /\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    out.push(buildMatch('LOG-PII-009', 'US Social Security Number in log message',
+      'A pattern matching the US SSN format with area/group/serial sanity appears in this log line.',
+      'Strip SSN at the request boundary. Required by GLBA, HIPAA, and many state laws.',
+      'CRITICAL', 'LOG_PII', m.index, m[0].length, m[0]));
+  }
+  return out;
+};
+
+/** LOG-PII-010: PEM-body-only private key (header stripped by log shipper). */
+export const ruleLogPemPrivateKeyBody: LogRule = (line) => {
+  const out: LogRuleMatch[] = [];
+  // Labelled `private_key=` / `key=` with a long base64 body. PEM bodies start with
+  // `MII…` which is the DER SEQUENCE/INTEGER tag in base64.
+  const pattern = /\b(private[_-]?key|pkcs8|rsa[_-]?key|signing[_-]?key)"?\s*[:=]\s*"?(MII[A-Za-z0-9+/=]{600,})/g;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(line)) !== null) {
+    if (shannonEntropyBitsPerChar(m[2]) < 5.0) continue;
+    out.push(buildMatch('LOG-SEC-004', 'Private key block in log message',
+      'A labelled key field with a PKCS#8/PEM-body-shaped value appears in this log line.',
+      'Rotate the key; investigate the path that emitted it.',
+      'CRITICAL', 'LOG_SECRET', m.index, m[0].length, m[2]));
+  }
+  return out;
+};
+
 export const ALL_LOG_RULES: LogRule[] = [
   ruleLogPan,
   ruleLogUrlEncodedPan,
@@ -1105,6 +1218,13 @@ export const ALL_LOG_RULES: LogRule[] = [
   ruleLogGcpServiceAccount,
   ruleLogPublicOrApiToken,
   ruleLogGenericHighEntropySecret,
+  // ── 1.2 expansion ────────────────────────────────────────────────────
+  ruleLogBasicAuth,
+  ruleLogWebhookUrls,
+  ruleLogServiceKeysExtra,
+  ruleLogPresignedUrl,
+  ruleLogUsSsn,
+  ruleLogPemPrivateKeyBody,
 ];
 
 /** Run every rule against a single line. */

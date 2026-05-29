@@ -4,6 +4,7 @@ import { ASTParser } from '../parser/astParser';
 import { ASTVisitor } from '../parser/astVisitor';
 import { TaintTracker } from '../utils/taint';
 import { buildImportAliasMap, ImportAlias, resolveCalleeToExportedName } from '../utils/importAliases';
+import { ProjectContext } from '../utils/projectContext';
 
 /**
  * Containment indicators for path-traversal heuristics. Returns true when the enclosing
@@ -48,7 +49,8 @@ export class SsrfDetector {
   constructor(
     private filePath: string,
     private sourceFile: ts.SourceFile,
-    private parser: ASTParser
+    private parser: ASTParser,
+    private projectContext: ProjectContext | null = null
   ) {}
 
   detect(): DetectorResult {
@@ -205,6 +207,13 @@ export class SsrfDetector {
   }
 
   private getCallSinkName(call: ts.CallExpression): string {
+    // Cross-file: if a project re-export chain resolves to a known dangerous Node API,
+    // use the canonical (module, name) so the existing fsShape / outboundShape regex
+    // catches it the same as a direct import.
+    if (this.projectContext) {
+      const xfile = this.projectContext.callResolvesToDangerousBuiltin(this.filePath, call);
+      if (xfile) return `${xfile.module}.${xfile.name}`;
+    }
     // Try the import-alias resolver first — if the local callee resolves to a known
     // exported name from a module, use the exported name. This catches renamed imports
     // (`import { readFileSync as slurp } from 'fs'; slurp(name)`).
