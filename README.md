@@ -29,10 +29,37 @@ leak the value you searched for.
 
 ## Install
 
+### From source (development)
+
 ```bash
 npm install
-npm run build
+npm run build      # produces dist/ (tsc)
+node dist/index.js --path ./src
 ```
+
+### Self-contained release (offline / Windows, no `npm install`)
+
+Build a single bundled file that inlines the TypeScript compiler and all dependencies — it runs
+anywhere Node.js ≥ 18 is installed, with **zero** `npm install` on the target machine:
+
+```bash
+npm run package:release      # -> release/backend-code-review-v<version>.zip
+#   or
+npm run bundle               # -> release/code-review.js (just the bundle)
+```
+
+Unzip on the target and run directly:
+
+```bash
+# Windows (cmd / PowerShell)
+code-review.cmd --path C:\path\to\service\src --format sarif --output report.sarif
+node code-review.js --list-rules
+
+# macOS / Linux
+./code-review --path ./src --include-heuristics
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the air-gapped install procedure.
 
 ## Quick start
 

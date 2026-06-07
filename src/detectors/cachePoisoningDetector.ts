@@ -32,26 +32,38 @@ export class CachePoisoningDetector {
   }
 
   private checkCacheKeyInjection(node: ts.CallExpression): void {
-    const sourceText = node.getText(this.sourceFile);
+    // Match the cache-write CALL itself, not any enclosing call whose text merely contains one.
+    // Previously `app.get('/x', () => cache.set(req.headers.host, v))` fired on BOTH the route
+    // call and the inner `cache.set` (double report), because the route's full text contains the
+    // sink. Inspect `node.expression` (receiver.method) instead.
+    const callee = node.expression;
+    if (!ts.isPropertyAccessExpression(callee)) return;
+    const method = callee.name.text.toLowerCase();
+    const receiver = callee.expression.getText(this.sourceFile).toLowerCase();
+    const isCacheSink =
+      (/^(set|put|store|setex|hset|mset|add)$/.test(method) &&
+        /\b(cache|rediscache|memcache|memcached|kv|store|cacheclient)\b/.test(receiver)) ||
+      (/^(set|put|setex)$/.test(method) && /\bredis\b/.test(receiver)) ||
+      /memcache/.test(receiver);
+    if (!isCacheSink) return;
 
-    if (!/cache\.(set|put|store)|redis\.(set|put)|memcache/i.test(sourceText)) {
-      return;
-    }
+    // Only the KEY argument matters for poisoning — not the cached value or surrounding code.
+    const keyArg = node.arguments[0];
+    if (!keyArg) return;
+    const keyText = keyArg.getText(this.sourceFile);
 
-    const userControlledKey = /req\.(headers|query|params|url|originalUrl)|request\.(headers|query|params|url)/i.test(
-      sourceText
-    );
-    const keyIsNormalized = /sanitize|validate|normalize|encode|hash|sha|cacheKey/i.test(sourceText);
+    const userControlledKey = /\b(req|request)\.(headers|query|params|url|originalUrl|cookies)\b/i.test(keyText);
+    if (!userControlledKey) return;
 
-    if (!userControlledKey || keyIsNormalized) {
-      return;
-    }
+    // Normalization must apply to the KEY itself — an unrelated `hash(value)` / `validate(other)`
+    // elsewhere in the statement no longer suppresses a poisoned key.
+    const keyIsNormalized = /\b(sanitize|validate|normalize|encodeURIComponent|createHash|hmac|sha\d|allowlist|whitelist)\b/i.test(keyText);
+    if (keyIsNormalized) return;
 
     const lineNum = this.sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1;
-    const dangerousHeaders = ['host', 'referer', 'user-agent', 'x-forwarded-for', 'x-original-url'];
-    const headerPoisoning = dangerousHeaders.some((header) =>
-      new RegExp(`headers\\[.*${header}.*\\]|headers\\.${header}`, 'i').test(sourceText)
-    );
+    const headerPoisoning =
+      /\b(req|request)\.headers\b/i.test(keyText) &&
+      /\b(host|referer|referrer|user-?agent|x-forwarded-for|x-forwarded-host|x-original-url|forwarded)\b/i.test(keyText);
 
     this.findings.push({
       ruleId: headerPoisoning ? 'BCR-CACHE-002' : 'BCR-CACHE-001',
@@ -59,6 +71,7 @@ export class CachePoisoningDetector {
       line: lineNum,
       column: 0,
       severity: headerPoisoning ? 'CRITICAL' : 'HIGH',
+      confidence: 'CONFIRMED',
       category: 'CACHE_POISONING',
       title: headerPoisoning
         ? 'Exploitable Cache Poisoning via HTTP Header Keying'
@@ -66,7 +79,7 @@ export class CachePoisoningDetector {
       description: headerPoisoning
         ? 'Cache keying uses attacker-controlled HTTP headers (for example Host or X-Forwarded-For), enabling cross-user cache poisoning.'
         : 'Cache key is derived from attacker-controlled request data without normalization, enabling poisoned cache entries to be served to other users.',
-      code: sourceText,
+      code: node.getText(this.sourceFile).substring(0, 120),
       recommendation:
         'Use trusted server-side identifiers for cache keys and normalize any externally influenced dimensions before cache writes.',
     });

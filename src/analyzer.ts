@@ -31,7 +31,7 @@ import { ProofOfConcept } from './poc/types';
 import { PocMarkdownReportGenerator } from './poc/PocMarkdownReportGenerator';
 import { JSONReporter } from './reporter';
 import { Logger } from './utils/logger';
-import { getRule, isHeuristic, severityAtLeast, severityRank } from './rules/registry';
+import { defaultConfidenceFor, getRule, isHeuristic, severityAtLeast, severityRank } from './rules/registry';
 import { computeFingerprint, normalizePath } from './rules/fingerprint';
 import { Baseline, buildInlineSuppressions, isLineSuppressed } from './rules/baseline';
 import { ProjectContext } from './utils/projectContext';
@@ -367,6 +367,24 @@ export class BackendCodeReviewAnalyzer {
   private analyzeFile(filePath: string): void {
     this.filesAnalyzed++;
 
+    // Skip pathologically large files (generated bundles, vendored blobs). A single multi-MB file
+    // builds a huge AST and runs every detector over it — a memory/time sink with little signal.
+    const MAX_FILE_BYTES = 5 * 1024 * 1024;
+    try {
+      const size = fs.statSync(filePath).size;
+      if (size > MAX_FILE_BYTES) {
+        this.addRuntimeIssue({
+          type: 'PARSE_FAILURE',
+          severity: 'WARNING',
+          message: `Skipped: file is ${(size / 1024 / 1024).toFixed(1)} MB (> ${MAX_FILE_BYTES / 1024 / 1024} MB cap)`,
+          file: filePath,
+        });
+        return;
+      }
+    } catch {
+      /* stat failure falls through to the normal parse path, which reports its own error */
+    }
+
     const parser = new ASTParser(filePath);
     const sourceFile = parser.parse();
 
@@ -384,8 +402,11 @@ export class BackendCodeReviewAnalyzer {
     }
 
     // Build per-file inline suppressions once — reused by every detector's findings.
+    // Key through canonicalFileKey so the store side (fast-glob emits forward-slash absolute
+    // paths on every OS) and the lookup side (path.resolve emits native separators) agree on
+    // Windows; otherwise `// bcr-disable-line` suppressions silently no-op there.
     this.inlineSuppressionByFile.set(
-      filePath,
+      this.canonicalFileKey(filePath),
       buildInlineSuppressions(sourceFile.getFullText())
     );
 
@@ -481,7 +502,7 @@ export class BackendCodeReviewAnalyzer {
       }
 
       // 4. Inline suppression
-      const inlineMap = this.inlineSuppressionByFile.get(this.toAbsoluteFile(finding.file));
+      const inlineMap = this.inlineSuppressionByFile.get(this.canonicalFileKey(finding.file));
       if (inlineMap) {
         const result = isLineSuppressed(inlineMap, finding.line, finding.ruleId);
         if (result.suppressed) {
@@ -536,6 +557,8 @@ export class BackendCodeReviewAnalyzer {
       file: this.toDisplayPath(finding.file),
       cwe: finding.cwe ?? rule?.cwe,
       owasp: finding.owasp ?? rule?.owasp,
+      // Back-fill confidence so every reported finding carries one; detectors may override.
+      confidence: finding.confidence ?? defaultConfidenceFor(ruleId),
     };
 
     enriched.fingerprint = enriched.fingerprint ?? computeFingerprint(enriched);
@@ -647,6 +670,16 @@ export class BackendCodeReviewAnalyzer {
       return displayOrAbsolute;
     }
     return path.resolve(process.cwd(), displayOrAbsolute);
+  }
+
+  /**
+   * Single canonical key for per-file maps. Runs the path through `path.resolve` so the
+   * separator style is the OS-native one on both the store side (absolute forward-slash
+   * paths from fast-glob) and the lookup side (display paths resolved against cwd). Without
+   * this, keys collide only on POSIX and diverge on Windows.
+   */
+  private canonicalFileKey(file: string): string {
+    return path.resolve(this.toAbsoluteFile(file));
   }
 
 }

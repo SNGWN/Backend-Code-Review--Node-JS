@@ -77,6 +77,22 @@ describe('SearchAnalyzer', () => {
     expect(report.hits[0].excerpt).toMatch(/al\*+ae/);
   });
 
+  test('redacts detected secrets even when the query matched a structured field (no visible-text match)', async () => {
+    // The query term is NOT present in the message text, so the analyzer falls to the
+    // structured-field branch. A PAN in the message must still be masked — the tool must never
+    // leak the very data a compliance reviewer cannot see into its own report.
+    const client = new FakeSearchClient([
+      hit('payment processed card 4111111111111111 amount 50', 'doc-1'),
+    ]);
+    const report = await new SearchAnalyzer(client).search({
+      query: 'kubernetes.namespace:prod',
+      from: '2026-05-22T00:00:00Z',
+      to: '2026-05-29T00:00:00Z',
+    });
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('4111111111111111');
+  });
+
   test('container scope is optional — entire-cluster search', async () => {
     const client = new FakeSearchClient([hit('x', 'doc-1')]);
     const report = await new SearchAnalyzer(client).search({

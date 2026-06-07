@@ -84,8 +84,54 @@ export class ApiKeyDetector {
     this.detectKeysInLogs();
     this.detectKeysInErrorMessages();
     this.detectDatabaseConnectionStrings();
+    this.detectEnvVarFallbackSecrets();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * BCR-KEY-008: a secret-like environment variable falling back to a hardcoded literal,
+   * e.g. `process.env.JWT_SECRET || 'dev-secret'`. When the env var is unset in any
+   * environment the service silently runs on the attacker-knowable default — a classic
+   * staging/prod misconfiguration that bypasses signature/encryption guarantees.
+   */
+  private detectEnvVarFallbackSecrets(): void {
+    const SECRET_ENV = /(secret|token|key|password|passwd|pwd|credential|private[_-]?key|api[_-]?key|jwt|signing|encryption|salt|hmac|client[_-]?secret)/i;
+    const binaries = ASTVisitor.findNodes(
+      this.sourceFile,
+      (node) =>
+        ts.isBinaryExpression(node) &&
+        (node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+          node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) as ts.BinaryExpression[];
+
+    binaries.forEach((bin) => {
+      // LHS must be a `process.env.X` / `process.env['X']` access for a secret-like X.
+      const leftText = bin.left.getText(this.sourceFile);
+      if (!/process\.env\b/.test(leftText)) return;
+      if (!SECRET_ENV.test(leftText)) return;
+
+      // RHS must be a non-empty string literal that is not an obvious placeholder.
+      const right = bin.right;
+      if (!(ts.isStringLiteral(right) || ts.isNoSubstitutionTemplateLiteral(right))) return;
+      const literal = right.text;
+      if (literal.length < 3) return; // '' or trivial placeholders aren't a usable secret
+      if (/^(undefined|null|none|false|true|0)$/i.test(literal)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(bin.getStart());
+      this.findings.push({
+        ruleId: 'BCR-KEY-008',
+        category: 'API_KEY_EXPOSURE',
+        severity: 'HIGH',
+        title: 'Hardcoded Secret as Environment-Variable Fallback',
+        description: `A secret-like environment variable falls back to the hardcoded literal "${literal.length > 32 ? literal.slice(0, 29) + '…' : literal}". If the env var is unset, the service runs on this known default.`,
+        file: this.filePath,
+        line,
+        column,
+        code: bin.getText(this.sourceFile).substring(0, 120),
+        recommendation: 'Fail closed when a required secret is missing (throw on startup) instead of defaulting to a literal.',
+      });
+    });
   }
 
   /**
@@ -319,8 +365,9 @@ export class ApiKeyDetector {
       const callExpr = node as ts.CallExpression;
       const funcName = callExpr.expression.getText().toLowerCase();
 
-      // Check if this is a logging function
-      if (/console\.(log|error|warn|info)|logger\.(log|error|warn|info)|debug|print/i.test(funcName)) {
+      // Check if this is a logging function. `\b` anchors `debug`/`print` so they don't match
+      // inside `sprintf`, `fingerprint`, `blueprint`, `debugger`, etc.
+      if (/console\.(log|error|warn|info|debug)|logger\.(log|error|warn|info|debug|trace)|\b(debug|println?|printf)\b/i.test(funcName)) {
         callExpr.arguments.forEach((arg) => {
           const argText = arg.getText();
           const { line, column } = this.parser.getLineAndColumn(arg.getStart());

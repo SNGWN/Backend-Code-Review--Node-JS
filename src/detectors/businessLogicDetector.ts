@@ -11,6 +11,7 @@ import {
   RouteHandlerContext,
 } from '../utils/detectorLogic';
 import { computePocId } from '../rules/fingerprint';
+import { TaintTracker } from '../utils/taint';
 
 /**
  * Business Logic Flaw Detector
@@ -37,6 +38,7 @@ export class BusinessLogicDetector {
   private parser: ASTParser;
   private generatedPocs: ProofOfConcept[] = [];
   private findingKeys = new Set<string>();
+  private taintTracker: TaintTracker | null = null;
 
   constructor(filePath: string, sourceFile: ts.SourceFile, parser: ASTParser) {
     this.filePath = filePath;
@@ -63,10 +65,12 @@ export class BusinessLogicDetector {
     this.findings = [];
     this.generatedPocs = [];
     this.findingKeys.clear();
+    this.taintTracker = new TaintTracker(this.sourceFile);
 
     this.detectRaceConditions();
     this.detectMissingIdempotencyKeys();
     this.detectInsufficientFundsCheck();
+    this.detectNonAtomicCheckThenAct();
     this.detectClientSidePriceUsage();
     this.detectInventoryOverSelling();
 
@@ -234,6 +238,108 @@ export class BusinessLogicDetector {
   }
 
   /**
+   * Detects TOCTOU where the check and the act are SEPARATE statements (M15/M43).
+   *
+   * `detectInsufficientFundsCheck` only catches the case where the mutation sits inside the
+   * guarding `if`'s then-branch. The more common — and more dangerous — shape spreads across
+   * sibling statements within one function:
+   *
+   *     const balance = await wallet.getBalance(userId);   // time-of-check (read)
+   *     if (balance < amount) throw new Error('insufficient');
+   *     await wallet.debit(userId, amount);                // time-of-use (sibling, unguarded write)
+   *
+   * Here the debit is NOT inside the `if`, so the text-substring detector misses it. This pass
+   * pairs a resource READ/guard with a later, non-atomic mutation of the SAME resource family that
+   * is not itself inside an `if`-then guard. Reported at TENTATIVE — DB-level atomicity (a unique
+   * constraint, an atomic conditional UPDATE in the repository) may make it safe — so the user
+   * confirms. Skipped entirely when the function already shows transaction/lock/atomic markers.
+   */
+  private detectNonAtomicCheckThenAct(): void {
+    const RESOURCE = /(balance|funds?|stock|quantity|inventory|wallet|credits?|points|available)/i;
+    const COMPARATOR = /[<>]=?/;
+    const MUTATION_VERB = /(debit|withdraw|decrement|deduct|charge|transfer|reserve|reduce|subtract|increment|update|save|set)/i;
+    const READ_VERB = /(get|find|select|fetch|read|current|load|lookup|balance|count)/i;
+    const ATOMIC = /(transaction|\.lock\(|for\s+update|mutex|semaphore|serializable|findoneandupdate|\$inc|\batomic\b|optimistic|pessimistic|rowlock|version\s*:|\.increment\(|\.decrement\(|\btx\b|\btrx\b|queryrunner|unitofwork)/i;
+
+    this.getFunctionLikeNodes().forEach((scope) => {
+      const scopeText = scope.getText(this.sourceFile);
+      const scopeLower = scopeText.toLowerCase();
+      if (!RESOURCE.test(scopeLower) || ATOMIC.test(scopeLower)) {
+        return;
+      }
+
+      // Check anchors: an `if` comparing the resource, OR a read call that loads the resource.
+      const checks: ts.Node[] = [];
+      (ASTVisitor.findNodes(scope, (n) => ts.isIfStatement(n)) as ts.IfStatement[]).forEach((ifStmt) => {
+        const cond = ifStmt.expression.getText(this.sourceFile);
+        if (RESOURCE.test(cond) && COMPARATOR.test(cond)) checks.push(ifStmt);
+      });
+      (ASTVisitor.findNodes(scope, (n) => ts.isCallExpression(n)) as ts.CallExpression[]).forEach((call) => {
+        const text = call.getText(this.sourceFile);
+        if (RESOURCE.test(text) && READ_VERB.test(text) && !MUTATION_VERB.test(text)) checks.push(call);
+      });
+      if (checks.length === 0) {
+        return;
+      }
+      const earliestCheck = Math.min(...checks.map((c) => c.getStart()));
+
+      // Act: a mutation of the resource AFTER the earliest check, that is NOT inside an `if`-then
+      // (that keeps this disjoint from the in-`if` BCR-BL-003 detector).
+      const act = (ASTVisitor.findNodes(scope, (n) => ts.isCallExpression(n)) as ts.CallExpression[])
+        .filter((call) => {
+          const text = call.getText(this.sourceFile);
+          return RESOURCE.test(text) && MUTATION_VERB.test(text);
+        })
+        .filter((call) => call.getStart() > earliestCheck)
+        .filter((call) => !this.isInsideIfThen(call, scope))
+        .sort((a, b) => a.getStart() - b.getStart())[0];
+
+      if (!act) {
+        return;
+      }
+
+      const { line, column } = this.parser.getLineAndColumn(act.getStart());
+      this.recordBusinessLogicFinding(
+        {
+          category: 'BUSINESS_LOGIC',
+          severity: 'HIGH',
+          ruleId: 'BCR-BL-003',
+          confidence: 'TENTATIVE',
+          verify:
+            'Confirm the read/guard and this mutation execute in the SAME transaction or under a row lock; as separate statements a concurrent request can interleave between them (double-spend / oversell).',
+          title: 'Time-of-Check to Time-of-Use (TOCTOU) Across Statements',
+          description:
+            'A resource value is read/checked and then mutated in a separate, non-atomic statement within the same function. Concurrent requests can interleave between the check and the update, bypassing the guard.',
+          file: this.filePath,
+          line,
+          column,
+          code: act.getText().substring(0, 80),
+          recommendation:
+            'Wrap the check and the mutation in one database transaction or take a row-level/pessimistic lock, or use an atomic conditional update (UPDATE … SET x = x - n WHERE x >= n).',
+        },
+        act.getText(),
+        line
+      );
+    });
+  }
+
+  /**
+   * True when `node` sits inside the then-branch of some enclosing `if` (up to `boundary`).
+   * Used to keep the cross-statement TOCTOU pass disjoint from the in-`if` balance detector.
+   */
+  private isInsideIfThen(node: ts.Node, boundary: ts.Node): boolean {
+    let current: ts.Node = node;
+    while (current.parent && current !== boundary) {
+      const parent = current.parent;
+      if (ts.isIfStatement(parent) && parent.thenStatement === current) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
+  /**
    * Detects client-side price usage in transactions
    * Looks for price parameters from request body in financial operations
    */
@@ -246,7 +352,14 @@ export class BusinessLogicDetector {
       const taintedVariables = this.buildRequestDerivedVariableSet(route.handler);
       const riskyAmount = this.findPaymentCalls(route.handler)
         .flatMap((callExpr) => this.getPaymentAmountExpressions(callExpr))
-        .find((expression) => this.referencesRequestDerivedInput(expression, taintedVariables));
+        // The local request-derived set is single-expression; also consult the (inter-procedural,
+        // framework-aware) TaintTracker so an amount laundered through a helper — `charge(getAmount(req))` —
+        // is still caught.
+        .find(
+          (expression) =>
+            this.referencesRequestDerivedInput(expression, taintedVariables) ||
+            (this.taintTracker?.isTainted(expression) ?? false)
+        );
 
       if (!riskyAmount) {
         return;

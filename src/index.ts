@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BackendCodeReviewAnalyzer, ExtendedAnalysisReport } from './analyzer';
@@ -7,12 +8,51 @@ import { Baseline } from './rules/baseline';
 import { listRules, severityAtLeast } from './rules/registry';
 import { Severity } from './types';
 import { Logger } from './utils/logger';
-import { KibanaClient, KibanaTransport } from './logs/kibanaClient';
+import { KibanaClient, KibanaTransport, scrubCredentialsFromUrl } from './logs/kibanaClient';
 import { LogReviewAnalyzer } from './logs/logReviewAnalyzer';
 import { SearchAnalyzer, SearchReport } from './logs/searchAnalyzer';
 
-const yargs = require('yargs/yargs') as (args?: readonly string[]) => import('yargs').Argv;
-const { hideBin } = require('yargs/helpers') as typeof import('yargs/helpers');
+// Interop-safe yargs resolution. Under plain CJS (tsc `dist/`, ts-node) `require('yargs/yargs')`
+// returns the factory function directly. When this file is bundled (esbuild single-file release),
+// the resolver may pull yargs' ESM build, in which case the factory arrives as a `.default` member.
+// `?? mod` covers both so the same source works in dev, tsc-build, and the bundled release.
+const yargsModule = require('yargs/yargs') as
+  | ((args?: readonly string[]) => import('yargs').Argv)
+  | { default: (args?: readonly string[]) => import('yargs').Argv };
+const yargs = (
+  typeof yargsModule === 'function' ? yargsModule : yargsModule.default
+) as (args?: readonly string[]) => import('yargs').Argv;
+const helpersModule = require('yargs/helpers') as
+  | typeof import('yargs/helpers')
+  | { default: typeof import('yargs/helpers') };
+const hideBin = (
+  'hideBin' in helpersModule ? helpersModule.hideBin : helpersModule.default.hideBin
+) as typeof import('yargs/helpers')['hideBin'];
+
+/**
+ * Tool version, resolved in a way that survives bundling. The esbuild release bundle
+ * inlines `__BCR_VERSION__` via `--define`; the plain tsc/ts-node path leaves it undefined
+ * (guarded by `typeof`) and reads package.json next to the compiled file. yargs' own
+ * `.version()` auto-detection reads package.json by walking up from argv[1], which fails
+ * inside the single-file bundle (no package.json there) — hence this explicit resolution.
+ */
+declare const __BCR_VERSION__: string | undefined;
+function resolveVersion(): string {
+  if (typeof __BCR_VERSION__ !== 'undefined' && __BCR_VERSION__) return __BCR_VERSION__;
+  for (const candidate of [
+    path.join(__dirname, '..', 'package.json'),
+    path.join(__dirname, 'package.json'),
+  ]) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(candidate, 'utf-8')) as { version?: string };
+      if (pkg.version) return pkg.version;
+    } catch {
+      /* try next candidate */
+    }
+  }
+  return '0.0.0';
+}
+const VERSION = resolveVersion();
 
 type OutputFormat = 'json' | 'text' | 'sarif';
 type RunMode = 'code' | 'logs' | 'search';
@@ -198,7 +238,7 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
       .example('$0 --list-rules | jq .', 'Inspect the rule catalog')
       .help()
       .alias('help', 'h')
-      .version()
+      .version(VERSION)
       // Reject unknown flags; previously yargs accepted anything and silently exited 0.
       .strict()
       .argv;
@@ -255,10 +295,10 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
 
     // Update-baseline mode: write the current finding set to the baseline and exit 0.
     if (argv['update-baseline']) {
-      const baselinePath = (argv.baseline as string | undefined) ?? '.security-baseline.json';
+      const baselinePath = resolveDefaultBaselinePath(argv.baseline as string | undefined, mode, argv.path as string | undefined);
       try {
         Baseline.write(baselinePath, getBaselineFindings());
-        Logger.success(`Baseline written to ${baselinePath}`);
+        Logger.success(`Baseline written to ${path.resolve(baselinePath)}`);
         return 0;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -270,7 +310,7 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
     const format = parseFormat(argv.format);
     const outputPath =
       (argv.output as string) ||
-      `code-review-${Date.now()}.${format === 'text' ? 'txt' : format === 'sarif' ? 'sarif' : 'json'}`;
+      defaultReportName('code-review', format === 'text' ? 'txt' : format === 'sarif' ? 'sarif' : 'json');
 
     try {
       writeReport(report, format, outputPath, Boolean(argv['show-suppressed']));
@@ -369,7 +409,7 @@ async function runLogReview(
   const logIndex = envOrFlag(argv['log-index'], 'LOG_INDEX') ?? 'filebeat-*';
   const days = Number(argv.days ?? process.env.LOG_REVIEW_DAYS ?? 15);
   const transport = parseTransport(argv.transport);
-  const maxHits = Number(argv['max-hits'] ?? 50_000);
+  const maxHits = parsePositiveInt(argv['max-hits'], 50_000);
   const insecure = Boolean(argv.insecure);
 
   let password: string | undefined;
@@ -463,7 +503,7 @@ async function runLogReview(
   try {
     const ping = await client.ping();
     if (!ping.ok) {
-      throw new CliUsageError(`Kibana/ES auth failed: HTTP ${ping.status}. Body: ${ping.body.slice(0, 200)}`);
+      throw new CliUsageError(`Kibana/ES auth failed: HTTP ${ping.status}. Body: ${scrubCredentialsFromUrl(ping.body.slice(0, 200))}`);
     }
   } catch (error) {
     if (error instanceof CliUsageError) throw error;
@@ -509,7 +549,7 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
   const logIndex = envOrFlag(argv['log-index'], 'LOG_INDEX') ?? '*';
   const days = Number(argv.days ?? process.env.LOG_REVIEW_DAYS ?? 7); // shorter default for search
   const transport = parseTransport(argv.transport);
-  const maxHits = Number(argv['max-hits'] ?? 200);
+  const maxHits = parsePositiveInt(argv['max-hits'], 200);
   const insecure = Boolean(argv.insecure);
   const query = typeof argv.query === 'string' ? argv.query : '';
 
@@ -616,13 +656,17 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
     });
   } finally {
     process.off('SIGINT', onSigint);
+    // SIGTERM was registered but never removed — a handler leak that accumulated a listener per
+    // in-process invocation (and could trip Node's MaxListenersExceededWarning).
+    process.off('SIGTERM', onSigterm);
   }
 
   const format = parseFormat(argv.format);
   const outputPath = (argv.output as string)
-    || `search-${Date.now()}.${format === 'text' ? 'txt' : 'json'}`;
+    || defaultReportName('search', format === 'text' ? 'txt' : 'json');
 
   try {
+    ensureParentDir(outputPath);
     if (format === 'text') {
       fs.writeFileSync(outputPath, formatSearchReportText(report), 'utf-8');
     } else {
@@ -634,7 +678,12 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
     return 1;
   }
 
-  Logger.info(`\n✓ ${report.totalHits} hit(s) matched`);
+  if (typeof report.matchedTotal === 'number' && report.matchedTotal > report.totalHits) {
+    const approx = report.matchedTotalRelation === 'gte' ? '≥' : '';
+    Logger.info(`\n✓ showing ${report.totalHits} of ${approx}${report.matchedTotal.toLocaleString()} matching document(s)`);
+  } else {
+    Logger.info(`\n✓ ${report.totalHits} hit(s) matched`);
+  }
   if (report.truncated) {
     Logger.warn(`Results truncated at --max-hits (${maxHits}). Tighten the query or narrow --days.`);
   }
@@ -650,6 +699,9 @@ function formatSearchReportText(report: SearchReport): string {
   lines.push(`Container : ${report.containerName ?? '(all)'}`);
   lines.push(`Window    : ${report.fromIso}  →  ${report.toIso}`);
   lines.push(`Hits      : ${report.totalHits}${report.truncated ? ' (truncated)' : ''}`);
+  if (typeof report.matchedTotal === 'number' && report.matchedTotal > report.totalHits) {
+    lines.push(`Matched   : ${report.matchedTotalRelation === 'gte' ? '≥' : ''}${report.matchedTotal} (returned ${report.totalHits})`);
+  }
   lines.push(`Duration  : ${report.durationMs} ms`);
   lines.push('');
   report.hits.forEach((hit, index) => {
@@ -662,18 +714,25 @@ function formatSearchReportText(report: SearchReport): string {
   return lines.join('\n');
 }
 
+function ensureParentDir(outputPath: string): void {
+  const dir = path.dirname(outputPath);
+  if (dir && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
 function writeReport(
   report: ExtendedAnalysisReport,
   format: OutputFormat,
   outputPath: string,
   includeSuppressed: boolean
 ): void {
+  // Create the parent directory for every format. Previously only SARIF did this, so
+  // `--output reports/out.json` threw ENOENT while `--output reports/out.sarif` worked.
+  ensureParentDir(outputPath);
+
   if (format === 'sarif') {
     const sarif = SarifReporter.build(report, { includeSuppressed });
-    const dir = path.dirname(outputPath);
-    if (dir && !fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
     fs.writeFileSync(outputPath, JSON.stringify(sarif, null, 2), 'utf-8');
     Logger.success(`SARIF report saved to ${outputPath}`);
     return;
@@ -685,6 +744,47 @@ function writeReport(
   }
 
   JSONReporter.writeReport(report, outputPath);
+}
+
+/**
+ * Parse a positive-integer flag, falling back to a default when the value is missing,
+ * non-numeric, or non-positive. Without this, `--max-hits abc` becomes NaN and the
+ * `yielded < maxHits` loop guard is always false, silently producing an empty scan.
+ */
+function parsePositiveInt(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+/**
+ * Default output filename when `--output` is omitted. Includes the timestamp PLUS the pid and a
+ * short random suffix so two runs started in the same millisecond (parallel CI shards, a tight
+ * loop) can't clobber each other's report — `Date.now()` alone collides at sub-ms cadence.
+ */
+function defaultReportName(prefix: string, ext: string): string {
+  const rand = crypto.randomBytes(3).toString('hex');
+  return `${prefix}-${Date.now()}-${process.pid}-${rand}.${ext}`;
+}
+
+/**
+ * Resolve where `--update-baseline` writes when `--baseline` isn't given. For a code scan we
+ * co-locate the baseline with the code it describes (so a sub-path scan like
+ * `--path services/payments` writes `services/payments/.security-baseline.json`, not a stray file
+ * in the cwd of whoever ran it). For logs/search there's no scanned path, so fall back to cwd.
+ */
+function resolveDefaultBaselinePath(explicit: string | undefined, mode: RunMode, scanPath: string | undefined): string {
+  if (explicit) return explicit;
+  if (mode === 'code' && scanPath) {
+    try {
+      const resolved = path.resolve(scanPath);
+      const dir = fs.existsSync(resolved) && fs.statSync(resolved).isDirectory() ? resolved : path.dirname(resolved);
+      return path.join(dir, '.security-baseline.json');
+    } catch {
+      /* fall through to cwd default */
+    }
+  }
+  return '.security-baseline.json';
 }
 
 function parseStringList(input: unknown): string[] | undefined {
@@ -719,8 +819,29 @@ function printRuleCatalog(): void {
   process.stdout.write(JSON.stringify(rows, null, 2) + '\n');
 }
 
+/**
+ * Drain stdout/stderr before exiting. `process.exit()` does NOT wait for buffered stdout to flush,
+ * so piping large output (e.g. `--list-rules | jq`) could truncate the JSON mid-write. Writing an
+ * empty chunk with a callback resolves only once the stream's buffer has been handed to the OS.
+ */
+function flushStdio(): Promise<void> {
+  const drain = (stream: NodeJS.WriteStream): Promise<void> =>
+    new Promise((resolve) => {
+      // `write('')` invokes the callback after the internal buffer is flushed; if the stream is
+      // already drained it resolves on the next tick. Guard against a missing callback path.
+      if (!stream.write('')) {
+        stream.once('drain', () => resolve());
+      } else {
+        resolve();
+      }
+    });
+  return Promise.all([drain(process.stdout), drain(process.stderr)]).then(() => undefined);
+}
+
 async function main() {
-  process.exit(await runCli());
+  const code = await runCli();
+  await flushStdio();
+  process.exit(code);
 }
 
 if (require.main === module) {

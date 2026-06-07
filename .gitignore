@@ -9,6 +9,10 @@ dist/**/*.d.ts
 dist/**/*.d.ts.map
 dist/**/*.js.map
 
+# Release bundle / packaging output (built by `npm run bundle` / `npm run package:release`)
+release/
+release-build/
+
 # IDE / OS
 .vscode/
 .idea/

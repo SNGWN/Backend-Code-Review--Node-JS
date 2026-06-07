@@ -1,6 +1,31 @@
+import { pathToFileURL } from 'url';
 import { AnalysisReport, Finding, Severity } from '../types';
 import { getRule, listRules, RuleDefinition } from '../rules/registry';
 import { normalizePath } from '../rules/fingerprint';
+
+/**
+ * SARIF `artifactLocation.uri` for a finding's file.
+ *
+ * `normalizePath` returns a cwd-relative, forward-slash path — a valid relative URI in the common
+ * case (including `../` parents). But when the scanned file lives on a DIFFERENT Windows drive than
+ * the cwd, `path.relative` can't relativize it and yields a drive-letter-absolute path (`D:/x.ts`)
+ * or UNC (`//host/share`); those are not valid relative URI references. Emit a proper absolute
+ * `file://` URI in that case so strict SARIF ingesters (GitHub code scanning, DefectDojo) accept it.
+ */
+function toArtifactUri(file: string): string {
+  const normalized = normalizePath(file);
+  const isDriveAbsolute = /^[A-Za-z]:\//.test(normalized);
+  const isUnc = normalized.startsWith('//');
+  const isPosixAbsolute = normalized.startsWith('/') && !isUnc;
+  if (isDriveAbsolute || isUnc || isPosixAbsolute) {
+    try {
+      return pathToFileURL(file).href;
+    } catch {
+      return normalized;
+    }
+  }
+  return normalized;
+}
 
 /**
  * SARIF 2.1.0 reporter. Output validates against:
@@ -61,7 +86,9 @@ interface SarifReportingDescriptor {
 
 interface SarifResult {
   ruleId: string;
-  ruleIndex: number;
+  // Optional: SARIF forbids a dangling ruleIndex that points nowhere. Omitted (rather than -1)
+  // for legacy/deprecated rule ids absent from the emitted `rules[]` so ingesters don't drop them.
+  ruleIndex?: number;
   level: SarifLevel;
   message: { text: string };
   locations: Array<{
@@ -194,19 +221,20 @@ export class SarifReporter {
   private static toResult(finding: Finding, ruleIndexById: Map<string, number>): SarifResult {
     const ruleId = finding.ruleId ?? 'BCR-LEGACY';
     const rule = getRule(ruleId);
-    const ruleIndex = ruleIndexById.get(ruleId) ?? -1;
+    const ruleIndex = ruleIndexById.get(ruleId);
 
     const level: SarifLevel = SEVERITY_TO_LEVEL[finding.severity];
 
     const result: SarifResult = {
       ruleId,
-      ruleIndex,
+      // Only attach ruleIndex when the rule actually exists in the emitted descriptor list.
+      ...(ruleIndex !== undefined ? { ruleIndex } : {}),
       level,
       message: { text: `${finding.title}: ${finding.description}` },
       locations: [
         {
           physicalLocation: {
-            artifactLocation: { uri: normalizePath(finding.file) },
+            artifactLocation: { uri: toArtifactUri(finding.file) },
             region: {
               startLine: Math.max(1, finding.line),
               startColumn: Math.max(1, finding.column),
@@ -218,11 +246,16 @@ export class SarifReporter {
       partialFingerprints: {
         // `primaryLocationLineHash/v1` is the SARIF-conventional name for "stable hash
         // anchored to the line content"; GitHub code scanning uses it directly for dedup.
-        'primaryLocationLineHash/v1': finding.fingerprint ?? '',
+        // Fall back to a per-location identity when no fingerprint was computed — an empty
+        // string would collapse every such finding into a single GitHub alert.
+        'primaryLocationLineHash/v1':
+          finding.fingerprint || `${ruleId}:${normalizePath(finding.file)}:${finding.line}`,
       },
       properties: {
         category: finding.category,
         severity: finding.severity,
+        confidence: finding.confidence ?? 'FIRM',
+        ...(finding.verify ? { verify: finding.verify } : {}),
         cwe: finding.cwe ?? rule?.cwe ?? [],
         owasp: finding.owasp ?? rule?.owasp,
         recommendation: finding.recommendation,

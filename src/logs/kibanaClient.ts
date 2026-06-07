@@ -86,8 +86,25 @@ export interface LogHit {
   source: Record<string, unknown>;
   /** Best-effort extraction of the human log line — see resolveMessage. */
   message: string;
+  /**
+   * Length of the PRIMARY message portion of `message`. `resolveMessage` appends a
+   * stringified `_source` projection (so rules can scan nested fields) after a newline;
+   * everything at offset `< messageFieldLength` is the human-facing Kibana `message` field,
+   * everything after the boundary is the structured projection. Excerpt builders use this to
+   * keep a finding's window — and its reported column — inside a single coherent field rather
+   * than letting it straddle the synthetic boundary (M30). Optional so hand-built hits (tests,
+   * non-client callers) default to treating the whole string as the primary message.
+   */
+  messageFieldLength?: number;
   /** ISO timestamp. */
   timestamp: string;
+}
+
+/** Parsed message: the primary human line plus a bounded stringified `_source` projection. */
+export interface ResolvedMessage {
+  message: string;
+  /** Offset where the structured `_source` projection begins (== primary length), if appended. */
+  primaryLength: number;
 }
 
 export interface SearchOptions {
@@ -139,6 +156,12 @@ export class KibanaClient {
   /** Reuse HTTP sockets across requests — pagination ships dozens of calls. */
   private readonly httpAgent: http.Agent;
   private readonly httpsAgent: https.Agent;
+  /**
+   * Total matched-document count from the most recent `searchFreeText` run, captured via
+   * `track_total_hits`. Reflects how many docs MATCHED, not how many were returned (which the
+   * page-size / maxHits cap bounds). `relation: 'gte'` means ES stopped counting at its cap.
+   */
+  private lastSearchTotal: { value: number; relation: 'eq' | 'gte' } | null = null;
 
   constructor(config: KibanaClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -178,6 +201,9 @@ export class KibanaClient {
     const maxHits = options.maxHits ?? DEFAULT_MAX_HITS;
     let yielded = 0;
     let searchAfter: unknown[] | undefined;
+    // Dedup across page boundaries — timestamp-only sort can re-return a doc that shared the
+    // boundary timestamp with the previous page's last hit.
+    const seenIds = new Set<string>();
 
     while (yielded < maxHits) {
       if (this.abortSignal?.aborted) {
@@ -199,12 +225,16 @@ export class KibanaClient {
         if (this.abortSignal?.aborted) {
           throw new Error('Log scan aborted by caller');
         }
+        if (hit._id && seenIds.has(hit._id)) continue;
+        if (hit._id) seenIds.add(hit._id);
         const source = hit._source ?? {};
+        const resolved = this.resolveMessage(source);
         yield {
           _id: hit._id,
           _index: hit._index,
           source,
-          message: this.resolveMessage(source),
+          message: resolved.message,
+          messageFieldLength: resolved.primaryLength,
           timestamp: this.resolveTimestamp(source),
         };
         yielded += 1;
@@ -235,6 +265,9 @@ export class KibanaClient {
     const maxHits = options.maxHits ?? 1_000;
     let yielded = 0;
     let searchAfter: unknown[] | undefined;
+    const seenIds = new Set<string>();
+    // Reset the matched-total so a prior run's value can't leak into this one.
+    this.lastSearchTotal = null;
 
     while (yielded < maxHits) {
       if (this.abortSignal?.aborted) {
@@ -242,6 +275,7 @@ export class KibanaClient {
       }
       const body = this.buildFreeTextBody(options, pageSize, searchAfter);
       const response = await this.search(body);
+      this.captureSearchTotal(response);
 
       const hits = (response.hits?.hits ?? []) as Array<{
         _id: string;
@@ -256,12 +290,16 @@ export class KibanaClient {
         if (this.abortSignal?.aborted) {
           throw new Error('Search aborted by caller');
         }
+        if (hit._id && seenIds.has(hit._id)) continue;
+        if (hit._id) seenIds.add(hit._id);
         const source = hit._source ?? {};
+        const resolved = this.resolveMessage(source);
         yield {
           _id: hit._id,
           _index: hit._index,
           source,
-          message: this.resolveMessage(source),
+          message: resolved.message,
+          messageFieldLength: resolved.primaryLength,
           timestamp: this.resolveTimestamp(source),
         };
         yielded += 1;
@@ -292,9 +330,13 @@ export class KibanaClient {
   private buildSearchBody(options: SearchOptions, pageSize: number, searchAfter?: unknown[]): Record<string, unknown> {
     const body: Record<string, unknown> = {
       size: pageSize,
+      // Sort on the timestamp only. The previous `{ _id: 'asc' }` tiebreaker requires fielddata
+      // on `_id`, which Elasticsearch disables by default since 7.6 — sorting on it returns a
+      // hard 400 (illegal_argument_exception) and aborts the whole scan. Duplicates that can
+      // appear at a page boundary when several docs share a timestamp are removed client-side
+      // by the `_id` dedup set in streamHits/searchFreeText.
       sort: [
         { [this.timestampField]: { order: 'asc' } },
-        { _id: 'asc' },
       ],
       query: {
         bool: {
@@ -328,20 +370,19 @@ export class KibanaClient {
       },
     ];
     if (options.containerName) {
-      // Comma-separated list → `terms` (multi-container fan-out). Single value → `term`.
       const containers = options.containerName.split(',').map((s) => s.trim()).filter(Boolean);
-      if (containers.length > 1) {
-        filter.push({ terms: { [`${this.containerField}.keyword`]: containers } });
-      } else {
-        filter.push({ term: { [`${this.containerField}.keyword`]: containers[0] } });
-      }
+      if (containers.length > 0) filter.push(this.containerMatch(containers));
     }
 
     const body: Record<string, unknown> = {
       size: pageSize,
+      // Count ALL matching docs, not just the page returned, so the report can show
+      // "showing N of M matched" instead of mislabeling the returned-count as the total (M32).
+      // `true` makes ES count exactly; without it ES stops at 10 000 and reports `gte`.
+      track_total_hits: true,
+      // Timestamp-only sort — see buildSearchBody for why the `_id` tiebreaker was removed.
       sort: [
         { [this.timestampField]: { order: 'desc' } },
-        { _id: 'asc' },
       ],
       query: {
         bool: {
@@ -349,9 +390,15 @@ export class KibanaClient {
             {
               query_string: {
                 query: options.query,
-                fields: ['message', 'msg', 'log.message', 'event.original', '*'],
+                // Restrict to the known message fields. Querying `*` fans the user's query
+                // across every field in every index (cluster-wide blast radius + DoS surface);
+                // `allow_leading_wildcard:false` blocks the `*term` form that forces full-index
+                // scans, and the determinized-states cap bounds pathological regex/wildcards.
+                fields: ['message', 'msg', 'log.message', 'event.original'],
                 default_operator: 'AND',
                 lenient: true,
+                allow_leading_wildcard: false,
+                max_determinized_states: 10000,
               },
             },
           ],
@@ -367,13 +414,49 @@ export class KibanaClient {
   private buildContainerFilters(containerName: string): unknown[] {
     const containers = containerName.split(',').map((s) => s.trim()).filter(Boolean);
     if (containers.length === 0) return [];
-    if (containers.length === 1) {
-      return [{ term: { [`${this.containerField}.keyword`]: containers[0] } }];
-    }
-    return [{ terms: { [`${this.containerField}.keyword`]: containers } }];
+    return [this.containerMatch(containers)];
   }
 
-  private async search(body: Record<string, unknown>): Promise<{ hits?: { hits?: unknown[] } }> {
+  /**
+   * Match the container on BOTH the analyzed field and its `.keyword` multifield. Clusters differ
+   * on whether the container field is keyword-typed (ECS) or text+keyword — hardcoding `.keyword`
+   * silently returns zero hits on keyword-only mappings.
+   */
+  private containerMatch(containers: string[]): unknown {
+    const field = this.containerField;
+    const make = (f: string): unknown =>
+      containers.length === 1 ? { term: { [f]: containers[0] } } : { terms: { [f]: containers } };
+    return { bool: { should: [make(`${field}.keyword`), make(field)], minimum_should_match: 1 } };
+  }
+
+  /**
+   * Matched-document total from the most recent `searchFreeText` run (via `track_total_hits`),
+   * or null if no free-text search has run. `relation: 'gte'` means ES capped the count.
+   */
+  getLastSearchTotal(): { value: number; relation: 'eq' | 'gte' } | null {
+    return this.lastSearchTotal;
+  }
+
+  /** Record the ES `hits.total` from a response. Keeps the largest value seen across pages. */
+  private captureSearchTotal(response: { hits?: { total?: unknown } }): void {
+    const total = response.hits?.total;
+    if (typeof total === 'number' && Number.isFinite(total)) {
+      this.lastSearchTotal = { value: total, relation: 'eq' };
+      return;
+    }
+    if (total && typeof total === 'object') {
+      const value = (total as { value?: unknown }).value;
+      const relation = (total as { relation?: unknown }).relation;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        this.lastSearchTotal = {
+          value,
+          relation: relation === 'gte' ? 'gte' : 'eq',
+        };
+      }
+    }
+  }
+
+  private async search(body: Record<string, unknown>): Promise<{ hits?: { hits?: unknown[]; total?: unknown } }> {
     const path = `/${encodeURIComponent(this.index)}/_search`;
     const url = this.transport === 'kibana-proxy'
       ? `${this.baseUrl}/api/console/proxy?path=${encodeURIComponent(path)}&method=POST`
@@ -474,8 +557,23 @@ export class KibanaClient {
 
       const request = lib.request(requestOptions, (response) => {
         const chunks: Buffer[] = [];
-        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        let received = 0;
+        // Cap the buffered response. A compromised/hostile upstream (or an LB serving a huge error
+        // page) could otherwise stream unbounded data into memory and then JSON.parse it.
+        const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+        let aborted = false;
+        response.on('data', (chunk: Buffer) => {
+          if (aborted) return;
+          received += chunk.length;
+          if (received > MAX_RESPONSE_BYTES) {
+            aborted = true;
+            request.destroy(new Error(`Response exceeded ${MAX_RESPONSE_BYTES} byte cap`));
+            return;
+          }
+          chunks.push(chunk);
+        });
         response.on('end', () => {
+          if (aborted) return;
           const responseBody = Buffer.concat(chunks).toString('utf-8');
           resolve({ status: response.statusCode ?? 0, body: responseBody });
         });
@@ -498,11 +596,13 @@ export class KibanaClient {
    * (e.g. `req.body.password`, `headers.authorization`). Scanning only the top-level
    * `message` would miss those entirely.
    *
-   * Output: `<primary message>\n<stringified _source>` so the rule engine sees both.
-   * The position offsets reported in matches stay meaningful for the primary message
-   * (which is what reviewers see in Kibana).
+   * Output: `<primary message>\n<stringified _source>` so the rule engine sees both, PLUS the
+   * boundary offset (`primaryLength`) so callers can keep each finding's excerpt and reported
+   * column inside ONE coherent field. A match in the primary region maps directly to Kibana's
+   * `message` field; a match in the structured region is labeled as `_source` rather than reported
+   * at a column that doesn't exist in the human message (M30).
    */
-  private resolveMessage(source: Record<string, unknown>): string {
+  private resolveMessage(source: Record<string, unknown>): ResolvedMessage {
     const candidates: unknown[] = [
       source.message,
       source.msg,
@@ -519,13 +619,32 @@ export class KibanaClient {
     } catch {
       structured = '';
     }
-    if (primary && structured) return `${primary}\n${structured}`;
-    return primary || structured;
+    // Bound the structured projection. Some indexers ship multi-megabyte _source docs; appending
+    // the whole thing per hit blows up memory across a 50k-hit scan and feeds an unbounded string
+    // to every per-line regex. 16KB is far more than any real credential/PAN needs.
+    const MAX_STRUCTURED = 16 * 1024;
+    if (structured.length > MAX_STRUCTURED) structured = structured.slice(0, MAX_STRUCTURED);
+    if (primary && structured) {
+      return { message: `${primary}\n${structured}`, primaryLength: primary.length };
+    }
+    const message = primary || structured;
+    // No appended structured part (or no primary) — the whole string is one field.
+    return { message, primaryLength: message.length };
   }
 
   private resolveTimestamp(source: Record<string, unknown>): string {
     const value = source[this.timestampField];
-    return typeof value === 'string' ? value : '';
+    if (typeof value === 'string') return value;
+    // Filebeat/ECS sometimes ship `@timestamp` as epoch_millis (a number). Coerce so the field
+    // isn't silently dropped (which left deep-links and report timestamps blank).
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      try {
+        return new Date(value).toISOString();
+      } catch {
+        return '';
+      }
+    }
+    return '';
   }
 
   /**
@@ -535,7 +654,12 @@ export class KibanaClient {
   buildKibanaDeepLink(hit: LogHit): string {
     // Kibana >= 7 uses `app/discover` with rison-encoded state. Building a perfect link
     // requires a saved search id; we ship a best-effort link to a doc lookup.
-    const path = `/app/discover#/?_g=(time:(from:'${hit.timestamp}',to:now))&_a=(index:'${this.index}',query:(language:kuery,query:'_id:"${hit._id}"'))`;
+    // `_id` and timestamp originate from Elasticsearch documents (attacker-influenceable for any
+    // service that writes its own logs) — URL-encode them so a crafted `_id` cannot break out of
+    // the rison/query context and inject extra URL state.
+    const safeId = encodeURIComponent(hit._id);
+    const safeTs = encodeURIComponent(hit.timestamp);
+    const path = `/app/discover#/?_g=(time:(from:'${safeTs}',to:now))&_a=(index:'${this.index}',query:(language:kuery,query:'_id:"${safeId}"'))`;
     return `${this.baseUrl}${path}`;
   }
 }

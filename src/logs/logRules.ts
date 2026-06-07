@@ -104,10 +104,18 @@ export function buildRedactedExcerpt(
   line: string,
   start: number,
   end: number,
-  otherMatches: Array<{ start: number; end: number }> = []
+  otherMatches: Array<{ start: number; end: number }> = [],
+  /**
+   * Optional field boundary `[lo, hi)`. When provided, the excerpt window is clamped so it cannot
+   * straddle the primary-message / structured-`_source` boundary — keeping the snippet (and any
+   * co-located masking) inside the single field the match belongs to (M30).
+   */
+  windowBounds?: { lo: number; hi: number }
 ): string {
-  const left = Math.max(0, start - 40);
-  const right = Math.min(line.length, end + 40);
+  const lo = windowBounds ? Math.max(0, windowBounds.lo) : 0;
+  const hi = windowBounds ? Math.min(line.length, windowBounds.hi) : line.length;
+  const left = Math.max(lo, start - 40);
+  const right = Math.min(hi, end + 40);
 
   // Mask the primary match AND any other matches inside the window. We build the
   // excerpt by walking the substring [left, right) and substituting masked
@@ -137,8 +145,8 @@ export function buildRedactedExcerpt(
   }
   out += line.slice(cursor, right);
 
-  const prefix = left === 0 ? '' : '…';
-  const suffix = right === line.length ? '' : '…';
+  const prefix = left === lo ? '' : '…';
+  const suffix = right === hi ? '' : '…';
   return `${prefix}${out}${suffix}`;
 }
 
@@ -331,7 +339,11 @@ export const ruleLogIban: LogRule = (line) => {
 /** LOG-PII-003: Email. */
 export const ruleLogEmail: LogRule = (line) => {
   const out: LogRuleMatch[] = [];
-  const pattern = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+  // Bounded, non-overlapping form. The previous `[A-Za-z0-9.-]+\.[A-Za-z]{2,}` let `.` belong to
+  // both the label class and the literal dot, giving catastrophic backtracking on inputs like
+  // `a@` + many letters with no final dot. Splitting the domain into discrete labels removes the
+  // ambiguity (≈678ms → ≈10ms on the worst case) while still matching real multi-label emails.
+  const pattern = /\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,24}\b/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(line)) !== null) {
     out.push({
@@ -1309,12 +1321,29 @@ export function matchToFinding(
   kibanaDeepLink: string | undefined,
   otherMatches: LogRuleMatch[] = []
 ): Finding {
+  // `resolveMessage` appends a stringified `_source` projection after the primary message so rules
+  // can scan nested fields. Clamp the excerpt window — and report the column — relative to the
+  // field the match actually landed in, so a structured-region hit isn't reported at a column that
+  // doesn't exist in Kibana's `message` field (M30).
+  const primaryLength = typeof hit.messageFieldLength === 'number' ? hit.messageFieldLength : hit.message.length;
+  const inStructured = match.start >= primaryLength && primaryLength < hit.message.length;
+  // Field window: primary is `[0, primaryLength)`; structured is `[primaryLength+1, end)` (the +1
+  // skips the single `\n` delimiter resolveMessage inserts between the two parts).
+  const windowBounds = inStructured
+    ? { lo: primaryLength + 1, hi: hit.message.length }
+    : { lo: 0, hi: primaryLength };
   const excerpt = buildRedactedExcerpt(
     hit.message,
     match.start,
     match.end,
-    otherMatches.filter((m) => m !== match).map((m) => ({ start: m.start, end: m.end }))
+    otherMatches.filter((m) => m !== match).map((m) => ({ start: m.start, end: m.end })),
+    windowBounds
   );
+  // Column is 1-based within its field. For a structured-region match, that's the offset past the
+  // boundary; the `_source` prefix on the snippet tells the reviewer it's a nested field, not the
+  // Kibana `message` line.
+  const column = inStructured ? match.start - (primaryLength + 1) + 1 : match.start + 1;
+  const labeledExcerpt = inStructured ? `[_source] ${excerpt}` : excerpt;
   return {
     ruleId: match.ruleId,
     category: match.category,
@@ -1324,9 +1353,9 @@ export function matchToFinding(
     // "file" is the log location, formatted so SARIF reporting still works.
     file: `${hit._index}/${hit._id}`,
     line: 1,
-    column: match.start + 1,
+    column: Math.max(1, column),
     // Keep the redacted excerpt as the code field — SARIF surfaces this as snippet.
-    code: excerpt,
+    code: labeledExcerpt,
     recommendation: match.recommendation,
     logEvidence: {
       docId: hit._id,
@@ -1334,7 +1363,7 @@ export function matchToFinding(
       timestamp: hit.timestamp,
       container: containerName,
       kibanaUrl: kibanaDeepLink,
-      excerpt,
+      excerpt: labeledExcerpt,
     },
   };
 }

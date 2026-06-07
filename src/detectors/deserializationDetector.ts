@@ -350,55 +350,44 @@ export class DeserializationDetector {
    * @private
    */
   private detectGadgetChainPatterns(): void {
-    const gadgetPatterns = [
-      /\.toJSON\s*\(/,
-      /\.valueOf\s*\(/,
-      /\.toString\s*\(/,
-      /\.constructor\s*\(/,
-      /Object\.create\s*\(/,
-      /Object\.defineProperty\s*\(/,
-    ];
-
-    const allCallExpressions = ASTVisitor.findNodes(this.sourceFile, (node) => {
-      return ts.isCallExpression(node);
-    });
+    // Tightened: `.toString()`/`.valueOf()`/`.toJSON()` were removed — they are ubiquitous and are
+    // NOT gadget chains by themselves (they produced the dominant false positives). The real
+    // prototype-manipulation gadget surface is Object.create / defineProperty / setPrototypeOf /
+    // assign and the Function constructor invoked with an untrusted descriptor/key.
+    const allCallExpressions = ASTVisitor.findNodes(this.sourceFile, (node) => ts.isCallExpression(node));
 
     allCallExpressions.forEach((node) => {
       const callExpr = node as ts.CallExpression;
-      const text = callExpr.getText();
+      const callee = callExpr.expression;
+      const calleeText = callee.getText(this.sourceFile);
 
-      // Check if any argument is untrusted and gadget pattern is used
-      const args = callExpr.arguments;
-      let hasUntrustedArg = false;
+      // The gadget primitive must be the CALL ITSELF, not merely present in the text.
+      const isGadgetPrimitive =
+        /^(Object\.create|Object\.defineProperty|Object\.defineProperties|Object\.setPrototypeOf|Reflect\.set|Reflect\.defineProperty)$/.test(calleeText) ||
+        (ts.isPropertyAccessExpression(callee) && callee.name.text === 'constructor');
+      if (!isGadgetPrimitive) return;
 
-      args.forEach((arg) => {
-        if (this.referencesUntrustedAlias(arg)) {
-          hasUntrustedArg = true;
-        }
-      });
+      const hasUntrustedArg = callExpr.arguments.some((arg) => this.referencesUntrustedAlias(arg));
+      if (!hasUntrustedArg || hasValidationBoundary(callExpr, this.sourceFile)) return;
 
-      if (
-        hasUntrustedArg &&
-        !hasValidationBoundary(callExpr, this.sourceFile) &&
-        gadgetPatterns.some((pattern) => pattern.test(text))
-      ) {
-        const { line, column } = this.parser.getLineAndColumn(node.getStart());
-        const finding: Finding = {
-          ruleId: 'BCR-VAL-010',
-          category: 'VALIDATION',
-          severity: 'HIGH',
-          title: 'Potential Gadget Chain Usage',
-          description: 'Code uses object methods that could be part of gadget chains with untrusted input, potentially leading to code execution.',
-          file: this.filePath,
-          line,
-          column,
-          code: node.getText(),
-          recommendation: 'Avoid using untrusted data with methods that could be part of gadget chains. Use safe deserialization methods.',
-        };
+      const { line, column } = this.parser.getLineAndColumn(node.getStart());
+      const finding: Finding = {
+        ruleId: 'BCR-VAL-010',
+        category: 'VALIDATION',
+        severity: 'HIGH',
+        confidence: 'TENTATIVE',
+        verify: 'Confirm the untrusted value controls a property key / prototype descriptor (prototype pollution / gadget), not just a benign value.',
+        title: 'Potential Gadget Chain / Prototype Manipulation With Untrusted Input',
+        description: 'Untrusted input flows into a prototype/property-manipulation primitive (Object.create / defineProperty / setPrototypeOf / constructor), which can be chained into prototype pollution or code execution.',
+        file: this.filePath,
+        line,
+        column,
+        code: node.getText().substring(0, 120),
+        recommendation: 'Never pass untrusted data as a property descriptor or prototype. Validate keys against an allowlist and use Object.create(null) / Maps.',
+      };
 
-        this.generateDeserializationPoc(finding, 'GADGET_CHAIN');
-        this.findings.push(finding);
-      }
+      this.generateDeserializationPoc(finding, 'GADGET_CHAIN');
+      this.findings.push(finding);
     });
   }
 

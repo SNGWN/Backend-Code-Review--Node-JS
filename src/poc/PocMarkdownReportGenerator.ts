@@ -20,6 +20,27 @@ interface PocReportSummary {
  * chain-aware context, payload reliability, and remediation priorities.
  */
 export class PocMarkdownReportGenerator {
+  /**
+   * Emit a fenced code block whose fence is longer than any backtick run inside the content, so
+   * scanned source containing ``` cannot break out of the fence and inject arbitrary
+   * markdown/HTML into the report. Returns the lines to push.
+   */
+  private static codeBlock(content: string, lang = ''): string[] {
+    const text = content ?? '';
+    const runs: string[] = text.match(/`+/g) ?? [];
+    const longestRun = runs.reduce((max: number, run: string) => Math.max(max, run.length), 0);
+    const fence = '`'.repeat(Math.max(3, longestRun + 1));
+    return [`${fence}${lang}`, text, fence];
+  }
+
+  /** Neutralise HTML in finding-derived strings rendered into raw-HTML table cells. */
+  private static escapeHtml(value: string): string {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
   static generatePocMarkdown(poc: ProofOfConcept, relatedPocs: ProofOfConcept[] = []): string {
     const enriched = ExploitChainBuilder.enrichPoc(poc, relatedPocs);
     const sections: string[] = [];
@@ -44,9 +65,7 @@ export class PocMarkdownReportGenerator {
     if (enriched.codeFlow?.diagram) {
       sections.push('## Code Execution Flow');
       sections.push('');
-      sections.push('```');
-      sections.push(enriched.codeFlow.diagram);
-      sections.push('```');
+      sections.push(...this.codeBlock(enriched.codeFlow.diagram));
       sections.push('');
     }
 
@@ -113,9 +132,7 @@ export class PocMarkdownReportGenerator {
     if (enriched.remediationCode) {
       sections.push('### Fixed Code Example');
       sections.push('');
-      sections.push('```typescript');
-      sections.push(enriched.remediationCode);
-      sections.push('```');
+      sections.push(...this.codeBlock(enriched.remediationCode, 'typescript'));
       sections.push('');
     }
 
@@ -128,7 +145,7 @@ export class PocMarkdownReportGenerator {
       sections.push(`- **Related CVEs**: ${enriched.relatedCves.join(', ')}`);
     }
     if (enriched.cvssScore) {
-      sections.push(`- **CVSS Score**: ${enriched.cvssScore}`);
+      sections.push(`- **CVSS Score (estimated)**: ${enriched.cvssScore}`);
     }
     sections.push('');
     sections.push('---');
@@ -284,12 +301,13 @@ export class PocMarkdownReportGenerator {
     const payloadSummary = poc.exploitInsights?.payloadExecution;
     const difficulty = payloadSummary?.easiestDifficulty || 'medium';
 
+    const esc = PocMarkdownReportGenerator.escapeHtml;
     return [
       '<table>',
-      '<tr><td><strong>Vulnerability Type</strong></td><td>' + poc.vulnerabilityType + '</td></tr>',
-      '<tr><td><strong>Severity</strong></td><td>' + poc.severity + '</td></tr>',
-      '<tr><td><strong>Attack Complexity</strong></td><td>' + (poc.exploitInsights?.attackComplexity || 'medium') + '</td></tr>',
-      '<tr><td><strong>Easiest Payload</strong></td><td>' + difficulty + '</td></tr>',
+      '<tr><td><strong>Vulnerability Type</strong></td><td>' + esc(poc.vulnerabilityType) + '</td></tr>',
+      '<tr><td><strong>Severity</strong></td><td>' + esc(poc.severity) + '</td></tr>',
+      '<tr><td><strong>Attack Complexity</strong></td><td>' + esc(poc.exploitInsights?.attackComplexity || 'medium') + '</td></tr>',
+      '<tr><td><strong>Easiest Payload</strong></td><td>' + esc(difficulty) + '</td></tr>',
       '<tr><td><strong>Chainable</strong></td><td>' + ((poc.exploitInsights?.chainOpportunities?.length || 0) > 0 ? 'yes' : 'no') + '</td></tr>',
       '</table>',
     ].join('\n');
@@ -305,7 +323,7 @@ export class PocMarkdownReportGenerator {
     if (payloadSummary) {
       lines.push(`- **Reliable Payloads**: ${payloadSummary.reliablePayloadCount}/${payloadSummary.totalPayloads}`);
       if (typeof payloadSummary.averageSuccessRate === 'number') {
-        lines.push(`- **Average Success Rate**: ${payloadSummary.averageSuccessRate}%`);
+        lines.push(`- **Estimated Reliability (heuristic)**: ${payloadSummary.averageSuccessRate}%`);
       }
     }
 
@@ -334,16 +352,12 @@ export class PocMarkdownReportGenerator {
       lines.push('');
 
       if (step.codeSnippet) {
-        lines.push('```javascript');
-        lines.push(step.codeSnippet);
-        lines.push('```');
+        lines.push(...this.codeBlock(step.codeSnippet, 'javascript'));
         lines.push('');
       }
 
       if (step.payload) {
-        lines.push('```');
-        lines.push(step.payload);
-        lines.push('```');
+        lines.push(...this.codeBlock(step.payload));
         lines.push('');
       }
     });
@@ -364,15 +378,13 @@ export class PocMarkdownReportGenerator {
         lines.push(`- **Difficulty**: ${payload.difficulty}`);
       }
       if (typeof payload.successRate === 'number') {
-        lines.push(`- **Success Rate**: ${payload.successRate}%`);
+        lines.push(`- **Estimated Reliability (heuristic, not measured)**: ${payload.successRate}%`);
       }
       if (payload.expectedOutput) {
         lines.push(`- **Expected Output**: ${payload.expectedOutput}`);
       }
       lines.push('');
-      lines.push('```' + payload.contentType);
-      lines.push(payload.content);
-      lines.push('```');
+      lines.push(...this.codeBlock(payload.content, payload.contentType));
       lines.push('');
     });
 

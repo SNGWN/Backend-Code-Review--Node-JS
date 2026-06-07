@@ -45,6 +45,7 @@ export class JwtBypassDetector {
     this.detectKeyConfusion();
     this.detectWeakSecrets();
     this.detectMissingExpValidation();
+    this.detectTokenSignedWithoutExpiration();
     this.detectCachedTokenUsage();
     this.detectMissingKidValidation();
 
@@ -363,6 +364,47 @@ export class JwtBypassDetector {
           this.generatePoc('missing-exp-validation', finding, code);
         }
       }
+    });
+  }
+
+  /**
+   * Detects `jwt.sign(payload, secret)` with no expiry — the token never ages out. Reported at
+   * TENTATIVE because some tokens are intentionally long-lived (machine API tokens); the user
+   * confirms intent rather than the tool dropping it.
+   */
+  private detectTokenSignedWithoutExpiration(): void {
+    const signNodes = ASTVisitor.findNodes(this.sourceFile, (node) => {
+      if (!ts.isCallExpression(node)) return false;
+      const expr = node.expression;
+      if (!ts.isPropertyAccessExpression(expr)) return false;
+      const objName = this.getObjectName(expr.expression);
+      return expr.name.text === 'sign' && (objName === 'jwt' || objName === 'JWT');
+    });
+
+    signNodes.forEach((node) => {
+      const call = node as ts.CallExpression;
+      const payloadText = call.arguments[0]?.getText() ?? '';
+      const optionsText = call.arguments[2]?.getText() ?? '';
+      const hasExpiry =
+        /\b(expiresIn|notBefore)\b/.test(optionsText) || /\bexp\b\s*:/.test(payloadText);
+      if (hasExpiry) return;
+
+      const position = this.sourceFile.getLineAndCharacterOfPosition(node.getStart());
+      const line = position.line + 1;
+      this.findings.push({
+        ruleId: 'BCR-JWT-009',
+        category: 'AUTHENTICATION',
+        severity: 'MEDIUM',
+        confidence: 'TENTATIVE',
+        verify: 'Confirm this token is meant to live forever; if not, add { expiresIn: ... }.',
+        title: 'JWT Signed Without Expiration',
+        description: 'jwt.sign() is called with no expiresIn option and no exp claim — the token never expires.',
+        file: this.filePath,
+        line,
+        column: position.character + 1,
+        code: this.getCodeSnippet(line),
+        recommendation: 'Add an expiry: jwt.sign(payload, secret, { expiresIn: "15m" }). Use short-lived access tokens.',
+      });
     });
   }
 

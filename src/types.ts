@@ -1,6 +1,17 @@
 import { ProofOfConcept } from './poc/types';
 
 export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
+
+/**
+ * How sure the scanner is that a finding is a real, exploitable issue — orthogonal to severity
+ * (which is the impact IF real). Lets the tool *surface* uncertain findings with context instead
+ * of silently dropping them, so a human decides.
+ *   - CONFIRMED: data-flow / structural evidence ties attacker input to the sink with no guard.
+ *   - FIRM:      a strong, specific signal but one unverified link (e.g. a dangerous API on
+ *                likely-tainted input, or a request DTO that *may* be validated by a pipe).
+ *   - TENTATIVE: a weak/heuristic signal worth a human look — reported, never auto-suppressed.
+ */
+export type Confidence = 'CONFIRMED' | 'FIRM' | 'TENTATIVE';
 export type IssueCategory =
   | 'AUTHENTICATION'
   | 'VALIDATION'
@@ -53,6 +64,17 @@ export interface Finding {
   ruleId?: string;
   category: IssueCategory;
   severity: Severity;
+  /**
+   * Confidence that this finding is real/exploitable. Optional on emit — the analyzer back-fills
+   * from the rule registry (heuristic rules → TENTATIVE, otherwise FIRM) when a detector does not
+   * set it. Detectors that confirm a taint flow end-to-end set CONFIRMED.
+   */
+  confidence?: Confidence;
+  /**
+   * Optional reviewer guidance attached to lower-confidence findings: what to check to confirm or
+   * dismiss. Surfaced so the user can decide rather than the tool silently suppressing.
+   */
+  verify?: string;
   title: string;
   description: string;
   file: string;
@@ -100,6 +122,8 @@ export interface AnalysisReport {
   totalFindings: number;
   findingsByCategory: Record<IssueCategory, number>;
   findingsBySeverity: Record<Severity, number>;
+  /** Per-confidence counts (CONFIRMED / FIRM / TENTATIVE). Helps triage "act now" vs "review". */
+  findingsByConfidence?: Record<Confidence, number>;
   /**
    * Per-rule firing counts. PCI-DSS Req 10 evidence asks for "how many findings
    * per rule" cross-referenced with the rule catalog — this is the answer.

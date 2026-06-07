@@ -1,6 +1,6 @@
 {
   "name": "backend-code-review--node-js",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Two-mode security scanner for Node.js / TypeScript backends: static SAST on source + PCI / PDPL / secret review on Kibana / Elasticsearch logs. SARIF, baseline, stable rule IDs, CWE / OWASP mapping.",
   "keywords": [
     "security",
@@ -48,6 +48,8 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
+    "bundle": "node scripts/bundle.mjs",
+    "package:release": "npm run bundle && node scripts/package-release.mjs",
     "scan:self": "node dist/index.js --path ./src --format sarif --output bcr-self.sarif --include-heuristics"
   },
   "author": "",
@@ -56,15 +58,16 @@
   "dependencies": {
     "fast-glob": "^3.3.3",
     "ignore": "^7.0.5",
-    "yargs": "^18.0.0"
+    "typescript": "^6.0.3",
+    "yargs": "^17.7.2"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",
     "@types/node": "^25.6.0",
     "@types/yargs": "^17.0.32",
+    "esbuild": "^0.25.12",
     "jest": "^30.3.0",
     "ts-jest": "^29.4.9",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "ts-node": "^10.9.2"
   }
 }

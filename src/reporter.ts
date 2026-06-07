@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { AnalysisReport, Finding, IssueCategory, RuntimeIssue, RuntimeIssueType, Severity } from './types';
+import { AnalysisReport, Confidence, Finding, IssueCategory, RuntimeIssue, RuntimeIssueType, Severity } from './types';
 import { Logger } from './utils/logger';
 
 export class JSONReporter {
@@ -48,10 +48,16 @@ export class JSONReporter {
       INFO: 0,
     };
 
+    const findingsByConfidence: Record<Confidence, number> = {
+      CONFIRMED: 0,
+      FIRM: 0,
+      TENTATIVE: 0,
+    };
     const findingsByRule: Record<string, number> = {};
     findings.forEach((finding) => {
       findingsByCategory[finding.category]++;
       findingsBySeverity[finding.severity]++;
+      if (finding.confidence) findingsByConfidence[finding.confidence]++;
       const id = finding.ruleId ?? `LEGACY:${finding.category}`;
       findingsByRule[id] = (findingsByRule[id] ?? 0) + 1;
     });
@@ -65,6 +71,7 @@ export class JSONReporter {
       totalFindings: findings.length,
       findingsByCategory,
       findingsBySeverity,
+      findingsByConfidence,
       findingsByRule,
       // Trust the caller's ordering — `analyzer.getReportFindings()` already sorts
       // deterministically (severity desc, file asc, line asc, ruleId asc) and we
@@ -131,6 +138,13 @@ export class JSONReporter {
     Logger.info(`  • LOW:              ${report.findingsBySeverity.LOW}`);
     Logger.info(`  • INFO:             ${report.findingsBySeverity.INFO}\n`);
 
+    if (report.findingsByConfidence) {
+      Logger.info('Findings by Confidence:');
+      Logger.info(`  • CONFIRMED:        ${report.findingsByConfidence.CONFIRMED}`);
+      Logger.info(`  • FIRM:             ${report.findingsByConfidence.FIRM}`);
+      Logger.info(`  • TENTATIVE (review): ${report.findingsByConfidence.TENTATIVE}\n`);
+    }
+
     if (report.runtimeIssues.length > 0) {
       Logger.warn(`Runtime issues: ${report.runtimeIssues.length}`);
     }
@@ -192,7 +206,9 @@ export class JSONReporter {
         `${index + 1}. [${finding.severity}] ${finding.title} (${finding.file}:${finding.line}:${finding.column})`
       );
       lines.push(`   Category: ${this.formatCategoryLabel(finding.category)}`);
+      if (finding.confidence) lines.push(`   Confidence: ${finding.confidence}`);
       lines.push(`   Description: ${finding.description}`);
+      if (finding.verify) lines.push(`   To verify: ${finding.verify}`);
       lines.push(`   Recommendation: ${finding.recommendation}`);
     });
 

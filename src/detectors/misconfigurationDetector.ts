@@ -30,13 +30,89 @@ export class MisconfigurationDetector {
 
     ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
       this.checkCorsWildcard(call);
+      this.checkReflectedCors(call);
       this.checkBodyParserLimit(call);
       this.checkHelmetDefaults(call);
       this.checkBcryptCost(call);
       this.checkDeprecatedCipher(call);
     });
+    this.checkReflectedCorsHeaders();
 
     return { findings: this.findings };
+  }
+
+  // ── BCR-MISC-005 ─────────────────────────────────────────────────────────
+  // Reflected-origin CORS while credentials are enabled. Far more dangerous than a static
+  // wildcard: `origin: '*'` is actually rejected by browsers when credentials:true, but
+  // reflecting the caller's Origin back IS honored, letting any site read authenticated
+  // responses.
+  private checkReflectedCors(call: ts.CallExpression): void {
+    if (!this.calleeIs(call.expression, 'cors')) return;
+    const arg = call.arguments[0];
+    if (!arg || !ts.isObjectLiteralExpression(arg)) return;
+
+    let originReflected = false;
+    let credentials = false;
+    for (const prop of arg.properties) {
+      if (!ts.isPropertyAssignment(prop)) continue;
+      const name = ts.isIdentifier(prop.name) ? prop.name.text : ts.isStringLiteral(prop.name) ? prop.name.text : '';
+      if (name === 'origin') {
+        const value = prop.initializer;
+        const valueText = value.getText(this.sourceFile);
+        if (/\breq(?:uest)?\.headers\.origin\b|\breq(?:uest)?\.header\(\s*['"]origin/i.test(valueText)) {
+          originReflected = true;
+        } else if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) {
+          // A dynamic origin callback that unconditionally allows the caller. Skip when the
+          // body contains an allowlist comparison (includes/indexOf/===/test) — that's the safe shape.
+          const body = valueText;
+          const allowsUnconditionally = /\b(callback|cb|done)\s*\(\s*null\s*,\s*(true|origin)\s*\)/i.test(body);
+          const hasAllowlistCheck = /includes|indexOf|===|!==|allowlist|whitelist|\.test\(|\.some\(/i.test(body);
+          if (allowsUnconditionally && !hasAllowlistCheck) originReflected = true;
+        }
+      } else if (name === 'credentials' && prop.initializer.kind === ts.SyntaxKind.TrueKeyword) {
+        credentials = true;
+      }
+    }
+
+    if (originReflected && credentials) {
+      this.emit(call, {
+        ruleId: 'BCR-MISC-005',
+        severity: 'HIGH',
+        category: 'MISCONFIGURATION',
+        title: 'Reflected-Origin CORS With Credentials',
+        description: 'CORS reflects the request Origin (or unconditionally allows it) while credentials are enabled. Any website can make authenticated cross-origin requests and read the responses.',
+        recommendation: 'Allow only an explicit allowlist of trusted origins when credentials:true. Never reflect req.headers.origin with credentials enabled.',
+      });
+    }
+  }
+
+  // BCR-MISC-005 via raw response headers: ACAO set from the request Origin AND
+  // ACAC:true present somewhere in the same file.
+  private checkReflectedCorsHeaders(): void {
+    let acaoReflectCall: ts.CallExpression | null = null;
+    let acacTrue = false;
+    ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
+      const text = call.getText(this.sourceFile);
+      if (
+        /access-control-allow-origin/i.test(text) &&
+        /\breq(?:uest)?\.headers\.origin\b|\breq(?:uest)?\.header\(\s*['"]origin/i.test(text)
+      ) {
+        acaoReflectCall = call;
+      }
+      if (/access-control-allow-credentials/i.test(text) && /['"]true['"]|,\s*true\s*\)/i.test(text)) {
+        acacTrue = true;
+      }
+    });
+    if (acaoReflectCall && acacTrue) {
+      this.emit(acaoReflectCall, {
+        ruleId: 'BCR-MISC-005',
+        severity: 'HIGH',
+        category: 'MISCONFIGURATION',
+        title: 'Reflected-Origin CORS With Credentials',
+        description: 'Access-Control-Allow-Origin is set from the request Origin header while Access-Control-Allow-Credentials is true. Any website can read authenticated responses cross-origin.',
+        recommendation: 'Validate the Origin against an explicit allowlist before echoing it, and only then set credentials. Never reflect an arbitrary Origin with credentials enabled.',
+      });
+    }
   }
 
   // ── BCR-MISC-001 ─────────────────────────────────────────────────────────

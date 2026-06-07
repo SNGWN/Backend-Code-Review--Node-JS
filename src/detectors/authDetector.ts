@@ -2,6 +2,7 @@ import * as ts from 'typescript';
 import { Finding, DetectorResult } from '../types';
 import { ASTVisitor } from '../parser/astVisitor';
 import { ASTParser } from '../parser/astParser';
+import { getEnclosingScopeText } from '../utils/detectorLogic';
 /**
  * Best-effort heuristic for "this string looks like an actual secret, not a placeholder."
  * Rejects: short values, all-lowercase words, obvious sentinels ("changeme", "your-secret-here").
@@ -144,37 +145,43 @@ export class AuthenticationDetector {
       const parent = access.parent;
       if (!parent) return;
 
-      const hasVerification = this.hasTokenVerification(parent);
+      // Only flag tokens that are actually request-derived. A bare `.token` on some config object
+      // or DTO is not a JWT-verification concern; this gate removes the dominant false positive.
+      const scope = getEnclosingScopeText(access, this.sourceFile);
+      const isRequestDerived =
+        /\b(req|request)\.(headers|cookies|query|body|signedcookies)\b|authorization|bearer|x-access-token|getauthtoken/i.test(scope);
+      if (!isRequestDerived) return;
 
-      if (!hasVerification) {
-        const { line, column } = this.parser.getLineAndColumn(access.getStart());
-        this.findings.push({
-          ruleId: 'BCR-AUTH-001',
-          category: 'AUTHENTICATION',
-          severity: 'CRITICAL',
-          title: 'Unverified Token Usage',
-          description: 'Token is accessed without prior verification or validation.',
-          file: this.filePath,
-          line,
-          column,
-          code: access.getText(),
-          recommendation: 'Verify and validate the token before using it. Use middleware like jwt.verify().',
-        });
-      }
+      // Verification must be found in the enclosing FUNCTION scope, not just the immediate parent
+      // node — `const t = req.headers.token; ...; jwt.verify(t, secret)` is safe but the parent of
+      // the `.token` access shows no verification.
+      if (this.hasTokenVerification(scope)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(access.getStart());
+      this.findings.push({
+        ruleId: 'BCR-AUTH-001',
+        category: 'AUTHENTICATION',
+        severity: 'CRITICAL',
+        confidence: 'FIRM',
+        verify: 'Confirm the token reaches a sink (claims read / authorization) before a jwt.verify() / signature check.',
+        title: 'Unverified Token Usage',
+        description: 'A request-derived token is used without a prior signature verification in the same function. Attackers can forge token claims.',
+        file: this.filePath,
+        line,
+        column,
+        code: access.getText(),
+        recommendation: 'Verify and validate the token before using it. Use middleware like jwt.verify() with explicit algorithms.',
+      });
     });
   }
 
-  private hasTokenVerification(node: ts.Node): boolean {
-    const verifyPatterns = [
-      'verify',
-      'validate',
-      'decode',
-      'check',
-      'authenticate',
-    ];
-
-    const text = node.getText().toLowerCase();
-    return verifyPatterns.some((pattern) => text.includes(pattern));
+  private hasTokenVerification(scopeText: string): boolean {
+    // `decode` and `check` were removed: jwt.decode() does NOT verify the signature (it is itself a
+    // vuln signal), and `check` is too generic. Real verification is jwt.verify / passport /
+    // a named verify/validate/authenticate routine.
+    return /\bjwt\.verify\b|\bverify(token|jwt|signature)?\b|\bvalidate(token|jwt)?\b|passport\.authenticate|\bauthenticate(token|jwt)?\b|express-jwt|jwks/i.test(
+      scopeText
+    );
   }
 
   private detectWeakTokenHandling(): void {

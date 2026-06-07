@@ -1,4 +1,4 @@
-import { IssueCategory, Severity } from '../types';
+import { Confidence, IssueCategory, Severity } from '../types';
 
 /**
  * Stable rule definitions. Every finding emitted by the scanner references a `ruleId`
@@ -16,6 +16,8 @@ export interface RuleDefinition {
   title: string;
   category: IssueCategory;
   defaultSeverity: Severity;
+  /** Optional default confidence for the rule. Falls back to heuristic→TENTATIVE / else FIRM. */
+  defaultConfidence?: Confidence;
   cwe: string[];
   owasp: string;
   description: string;
@@ -160,6 +162,18 @@ const RULES: RuleDefinition[] = [
     recommendation: 'Always validate the kid claim and ensure it matches an expected key ID in your key store.',
     heuristic: true,
   },
+  {
+    id: 'BCR-JWT-009',
+    title: 'JWT Signed Without Expiration',
+    category: 'AUTHENTICATION',
+    defaultSeverity: 'MEDIUM',
+    defaultConfidence: 'TENTATIVE',
+    cwe: ['CWE-613'],
+    owasp: 'A07:2021 - Identification and Authentication Failures',
+    description: 'jwt.sign() is called with no `expiresIn` option and no `exp` claim in the payload. The token never expires, so a leaked/stolen token is valid forever and cannot be aged out.',
+    recommendation: 'Set an expiry: `jwt.sign(payload, secret, { expiresIn: "15m" })`, or include an `exp` claim. Use short-lived access tokens with refresh tokens.',
+    heuristic: true,
+  },
 
   // ── VALIDATION / INJECTION ─────────────────────────────────────────────────
   {
@@ -225,7 +239,7 @@ const RULES: RuleDefinition[] = [
   },
   {
     id: 'BCR-VAL-007',
-    title: 'Prototype Pollution Vulnerability',
+    title: 'Prototype Pollution via Untrusted Object Manipulation',
     category: 'VALIDATION',
     defaultSeverity: 'CRITICAL',
     cwe: ['CWE-1321'],
@@ -566,17 +580,27 @@ const RULES: RuleDefinition[] = [
     description: 'Database connection string contains hardcoded username and password.',
     recommendation: 'Use environment variables for database credentials.',
   },
+  {
+    id: 'BCR-KEY-008',
+    title: 'Hardcoded Secret as Environment-Variable Fallback',
+    category: 'API_KEY_EXPOSURE',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-798', 'CWE-258'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'A secret-like environment variable falls back to a hardcoded literal (e.g. `process.env.JWT_SECRET || "dev-secret"`). When the env var is unset in any environment, the service silently runs with the attacker-knowable default.',
+    recommendation: 'Fail closed when a required secret is missing (throw on startup) instead of defaulting to a literal. Never embed real secrets as fallbacks.',
+  },
 
   // ── CRYPTO WEAKNESS ────────────────────────────────────────────────────────
   {
     id: 'BCR-CRYPTO-001',
-    title: 'Weak Hashing of Password/Secret',
+    title: 'Weak Hashing Algorithm (MD5/SHA1)',
     category: 'CRYPTO_WEAKNESS',
     defaultSeverity: 'HIGH',
     cwe: ['CWE-327', 'CWE-916'],
     owasp: 'A02:2021 - Cryptographic Failures',
-    description: 'MD5/SHA1 used to hash passwords or secrets — these algorithms are broken for this purpose.',
-    recommendation: 'Use bcrypt, scrypt, or Argon2 for passwords.',
+    description: 'MD5 or SHA1 used via createHash/createHmac or a bare md5()/sha1() helper. Both are broken (collisions, length-extension) for passwords, signatures, HMAC, token derivation, and integrity.',
+    recommendation: 'Use bcrypt/scrypt/Argon2 for passwords and SHA-256 or stronger for integrity/signatures.',
     heuristic: true,
   },
   {
@@ -803,6 +827,16 @@ const RULES: RuleDefinition[] = [
     recommendation: 'Use a cost factor of at least 10 (current OWASP guidance: 12).',
   },
   {
+    id: 'BCR-MISC-005',
+    title: 'Reflected-Origin CORS With Credentials',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-942', 'CWE-346'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'Access-Control-Allow-Origin is reflected from the request Origin header (or a cors `origin` callback unconditionally allows the caller) while credentials are enabled. Any website can then make authenticated cross-origin requests and read the responses.',
+    recommendation: 'Allow only an explicit all-list of trusted origins when credentials:true. Never reflect req.headers.origin back as the allowed origin with credentials enabled.',
+  },
+  {
     id: 'BCR-CRYPTO-005',
     title: 'Deprecated crypto.createCipher (IV-less)',
     category: 'CRYPTO_WEAKNESS',
@@ -811,6 +845,17 @@ const RULES: RuleDefinition[] = [
     owasp: 'A02:2021 - Cryptographic Failures',
     description: 'crypto.createCipher / createDecipher derive the IV from the key and are deprecated. They produce identical ciphertext for identical plaintexts and are vulnerable to chosen-plaintext attacks.',
     recommendation: 'Use createCipheriv / createDecipheriv with a unique random IV per encryption (crypto.randomBytes(16)).',
+  },
+  {
+    id: 'BCR-CRYPTO-006',
+    title: 'Timing-Unsafe Secret/Signature Comparison',
+    category: 'CRYPTO_WEAKNESS',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-208', 'CWE-347'],
+    owasp: 'A02:2021 - Cryptographic Failures',
+    description: 'A secret, signature, HMAC, or token is compared with === / == — a non-constant-time comparison that leaks the value through response timing. The dominant impact is webhook signature bypass (Stripe/GitHub/Svix) and token brute-force.',
+    recommendation: 'Use crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)) after a length check, or the provider SDK verify (e.g. stripe.webhooks.constructEvent).',
+    heuristic: true,
   },
   {
     id: 'BCR-MA-006',
@@ -823,6 +868,16 @@ const RULES: RuleDefinition[] = [
     recommendation: 'Validate request payloads against an explicit schema (zod, joi, class-validator) before passing to service / ORM calls. Or use a whitelist (`pick`) extracting only allowed fields.',
   },
   {
+    id: 'BCR-MA-007',
+    title: 'Prototype Pollution via Dynamic Property Assignment',
+    category: 'MASS_ASSIGNMENT',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-1321'],
+    owasp: 'A08:2021 - Software and Data Integrity Failures',
+    description: 'A property is written using a dynamic, user-controlled key (`target[req.body.key] = value`, or a recursive merge over request data) with no guard against `__proto__` / `constructor` / `prototype`. An attacker can pollute Object.prototype, leading to denial of service, property injection, or RCE in downstream sinks.',
+    recommendation: 'Reject keys equal to `__proto__`, `constructor`, or `prototype`; use a Map or `Object.create(null)`; or set with `Object.defineProperty`. Use a hardened deep-merge (e.g. lodash >= 4.17.12 with guards).',
+  },
+  {
     id: 'BCR-VAL-012',
     title: 'Insecure Deserialization From Base64',
     category: 'VALIDATION',
@@ -831,6 +886,36 @@ const RULES: RuleDefinition[] = [
     owasp: 'A08:2021 - Software and Data Integrity Failures',
     description: '`Buffer.from(x, "base64").toString()` decodes attacker-controlled base64 and chains it into JSON.parse or credential splitting. Common in poorly-implemented Basic auth and webhook signature verification.',
     recommendation: 'Validate the decoded payload against a strict schema before parsing. For Basic auth, use a hardened library like `basic-auth`. For webhook signatures, verify HMAC before decoding.',
+  },
+  {
+    id: 'BCR-VAL-013',
+    title: 'NoSQL Injection via Unsanitized Operator Object',
+    category: 'VALIDATION',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-943', 'CWE-89'],
+    owasp: 'A03:2021 - Injection',
+    description: 'User-controlled input flows into a MongoDB/Mongoose query (find/findOne/update/aggregate, or a $where clause) without being coerced to a primitive. An attacker can submit `{"$gt":""}` / `{"$ne":null}` operator objects to bypass filters, or `$where`/`$function` to run server-side JavaScript.',
+    recommendation: 'Coerce query values to the expected primitive (String(x)/Number(x)) or validate against a schema before querying. Reject object-typed values for scalar fields. Never pass req.body/req.query objects directly as a query filter.',
+  },
+  {
+    id: 'BCR-VAL-014',
+    title: 'Server-Side Template Injection (SSTI)',
+    category: 'VALIDATION',
+    defaultSeverity: 'CRITICAL',
+    cwe: ['CWE-1336', 'CWE-94'],
+    owasp: 'A03:2021 - Injection',
+    description: 'A template engine compiles a template string built from user-controlled input (handlebars/pug/ejs/nunjucks/lodash compile or render-string with a tainted template). SSTI typically escalates to remote code execution.',
+    recommendation: 'Never compile templates from request data. Keep templates static and pass user data only as bound context values, not as the template source.',
+  },
+  {
+    id: 'BCR-VAL-015',
+    title: 'XML External Entity (XXE) Expansion Enabled',
+    category: 'VALIDATION',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-611', 'CWE-827'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'An XML parser is configured to resolve external entities (noent/resolveExternals/external-entity loading enabled, or libxml with `noent: true`). Parsing attacker XML allows file disclosure, SSRF, and denial of service (billion laughs).',
+    recommendation: 'Disable external entity and DTD processing (e.g. libxmljs `{ noent: false, nonet: true }`, or a parser that does not resolve entities by default). Validate/avoid XML from untrusted sources.',
   },
 
   // ── ID FROM WEAK RANDOMNESS ────────────────────────────────────────────────
@@ -1297,6 +1382,19 @@ export function listRules(): RuleDefinition[] {
 
 export function isHeuristic(ruleId: string): boolean {
   return BY_ID.get(ruleId)?.heuristic === true;
+}
+
+/**
+ * Default confidence for a rule when a detector does not set one on the finding. Heuristic rules
+ * fire on weaker signals → TENTATIVE; everything else → FIRM. Detectors that confirm a taint flow
+ * end-to-end override this with CONFIRMED on the finding itself.
+ */
+export function defaultConfidenceFor(ruleId: string | undefined): Confidence {
+  if (!ruleId) return 'FIRM';
+  const rule = BY_ID.get(ruleId);
+  if (!rule) return 'FIRM';
+  if (rule.defaultConfidence) return rule.defaultConfidence;
+  return rule.heuristic ? 'TENTATIVE' : 'FIRM';
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {

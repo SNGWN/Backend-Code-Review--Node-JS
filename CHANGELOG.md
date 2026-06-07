@@ -4,6 +4,146 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-06-07
+
+### Added — Framework-architecture awareness
+- Taint now seeds from backend ingress points beyond `req.*`: NestJS / type-graphql parameter
+  decorators (`@Body()`, `@Param()`, `@Query()`, `@Headers()`, `@Args()`, …), message-queue /
+  event-stream consumer callback payloads (`.consume()`, `.on()`, `eachMessage`, `.subscribe()`),
+  and Apollo-style GraphQL resolver `args`. Lets data flow be tracked controller → service →
+  repository and through consumers.
+- One-way transforms (hash/HMAC/encrypt/sign/random derivation) no longer propagate injection
+  taint to their output, in both the TaintTracker and the validation detector's taint map.
+
+### Added — Confidence model (`CONFIRMED` / `FIRM` / `TENTATIVE`)
+- Every finding now carries a `confidence` (and uncertain ones a `verify` hint). Surfaced in JSON,
+  text, and SARIF, with a `findingsByConfidence` summary. Lets the scanner *report* lower-certainty
+  findings for the user to triage instead of silently dropping them. Taint-confirmed sinks read as
+  CONFIRMED; heuristic rules as TENTATIVE.
+
+### Added — New rules
+- `BCR-JWT-009` JWT signed without expiration (TENTATIVE — intent-dependent).
+- `BCR-CRYPTO-006` Timing-unsafe secret/signature comparison (`===` on HMAC/signature → webhook
+  signature bypass).
+- (round 1) `BCR-VAL-013` NoSQL, `BCR-VAL-014` SSTI, `BCR-VAL-015` XXE, `BCR-MISC-005` reflected
+  CORS, `BCR-KEY-008` env-fallback secret, `BCR-MA-007` prototype pollution.
+
+### Fixed — Detection accuracy (round 2)
+- BOLA detector generalised beyond three hardcoded id names to any client-supplied id
+  (`userId`/`_id` → FIRM, ambiguous all-lowercase → TENTATIVE); lookup-context verbs word-bounded.
+- Unverified-token (`BCR-AUTH-001`) now checks the enclosing function scope (not just the parent
+  node), requires the token to be request-derived, and no longer treats `jwt.decode()`/`check` as
+  verification.
+- `isTainted` no longer resolves property-name positions (object keys, `.prop` names) as variable
+  references — fixed a class of validator/false-positive collisions.
+- Fingerprint now includes the line number so two distinct findings sharing a rule + code snippet
+  no longer collapse to one fingerprint (which let a baseline entry suppress an unrelated finding).
+  NOTE: this invalidates existing baselines — re-run `--update-baseline` once.
+- Baseline matching re-validates ruleId + file before suppressing (guards against truncated-hash
+  collisions / hand-edited baselines).
+- SSRF recognises `ky`/`needle`/`phin` and axios/got instance receivers (client/api/agent/…).
+- SARIF: omit dangling `ruleIndex` for legacy/deprecated ids; non-empty `partialFingerprints`
+  fallback so distinct findings don't collapse into one GitHub alert.
+
+### Fixed — Security / robustness (round 2)
+- ReDoS in the email log rule removed (non-overlapping bounded form).
+- POC markdown escapes embedded scanned source (dynamic code-fence length) and HTML-escapes
+  finding-derived values in raw HTML tables — closes a markdown/HTML/code-fence breakout vector.
+- Kibana: container filter matches both `field` and `field.keyword` (was zero-hits on keyword-only
+  mappings); `_source` projection and HTTP response body are size-capped; numeric epoch timestamps
+  coerced; `_id`/timestamp URL-encoded in the Discover deep-link.
+- Log-review caps per-line length before running the rule set (defence-in-depth against any
+  super-linear regex over attacker-controlled lines).
+
+### Added — Self-contained offline release (runs on Windows with zero `npm install`)
+- `npm run bundle` (esbuild) produces a single `release/code-review.js` that inlines the
+  TypeScript compiler, yargs, fast-glob and ignore. `npm run package:release` wraps it into
+  `release/backend-code-review-v<version>.zip` with Windows (`.cmd`) and POSIX launchers.
+- `.github/workflows/release.yml` — builds, tests, smoke-tests the bundle with **no
+  node_modules**, and attaches the ZIP to a tagged GitHub Release.
+- Bundle shims `import.meta.url` (for yargs' ESM shim) and injects the version via
+  `__BCR_VERSION__` so `--version` works without a co-located package.json.
+
+### Added — New exploitable-class detectors
+- `BCR-VAL-013` NoSQL injection (operator objects, `$where` server-side JavaScript).
+- `BCR-VAL-014` Server-Side Template Injection (handlebars/pug/ejs/nunjucks/lodash compile).
+- `BCR-VAL-015` XML External Entity (XXE) expansion enabled.
+- `BCR-MISC-005` Reflected-origin CORS with credentials (callback + raw-header forms).
+- `BCR-KEY-008` Hardcoded secret as `process.env.X || 'literal'` fallback.
+- `BCR-MA-007` Prototype pollution via dynamic user-controlled key / recursive merge.
+
+### Added — In-file inter-procedural taint
+- `TaintTracker` now builds per-function taint summaries (returns-untrusted / returns-param)
+  and propagates taint across calls to local helper functions — "tainted value flowing through
+  functions". SQL-injection detection now fires when the query string is built in a separate
+  variable and passed as a bare identifier to `.query()`.
+
+### Fixed — Packaging & cross-platform
+- `typescript` moved from devDependencies to dependencies (it is a runtime import; a production
+  install previously crashed on first scan).
+- `yargs` pinned to the last CommonJS line (`^17.7.2`); yargs 18 is ESM-only and threw
+  `ERR_REQUIRE_ESM` from the CJS `dist` on Node 18/20.
+- Inline `// bcr-disable-line` suppressions now work on Windows (per-file map keys are
+  canonicalised through `path.resolve` on both store and lookup).
+- `--output` to a non-existent directory creates it for json/text (previously SARIF-only);
+  `--max-hits` guards against `NaN` silently zeroing the scan.
+
+### Fixed — Detection accuracy
+- Taint source model tightened: dropped bare `payload`/`userdata` substrings and browser-only
+  `window.`/`document.`; added gRPC `call.request` and raw-header sources.
+- `getEnclosingScopeText` returns the enclosing **function** (not the innermost call) and strips
+  comments, so a `// TODO: check req.user...` comment is no longer counted as a real control.
+- Lexical-scope shadowing resolution in the taint tracker actually works now (previous version
+  was dead code that always fell back to the first declaration).
+- `BCR-CRYPTO-001` now catches `crypto.createHash('md5')` / `createHmac('sha1', …)` (previously
+  only bare `md5()`/`sha1()` helpers); `BCR-VAL-001` covers TypeORM/Knex `whereRaw`/`*Raw` sinks.
+
+### Fixed — Log / search subsystem
+- Removed the `_id` sort tiebreaker that returns HTTP 400 on default ES ≥ 7.6 (fielddata on
+  `_id` disabled); pagination now sorts on the timestamp with client-side `_id` dedup.
+- Free-text `query_string` no longer fans out across `fields: ['*']`; added
+  `allow_leading_wildcard: false` and a determinized-states cap.
+- Search-mode excerpts redact all detected secrets even when the query matched a structured
+  field, and never echo the raw stringified `_source`.
+
+### Added — Cross-layer coverage (round 3)
+- IDOR detection now follows the **service / repository layer**: a controller that delegates to
+  `accountService.getAccount(req.params.id)` (or `*Repository`/`*Dao`/`*Store`/`*Manager`/…) with a
+  client-supplied id and **no** ownership/tenant argument is reported (`BCR-AC-005`, TENTATIVE +
+  `verify`). Suppressed when an owner/tenant id is passed alongside, or an ownership check is visible
+  in scope — the guard may legitimately live inside the service, so the user confirms.
+- Business-logic **TOCTOU across statements** (`BCR-BL-003`): the check (a balance/stock read or
+  comparison) and the act (a non-atomic debit/decrement) no longer have to sit in the same `if` —
+  a guard followed by a sibling mutation of the same resource is now flagged (TENTATIVE), skipped
+  when the function shows transaction / lock / atomic-update markers (incl. `tx`/`trx`/queryRunner
+  transaction-callback handles).
+
+### Fixed — Cross-file & detection correctness (round 3)
+- Re-export resolution now mirrors ES-module semantics: a module's **own** local definition shadows
+  anything pulled in by `export *`. Previously a file that both defined `export function getId()`
+  and had `export * from './other'` mis-resolved `getId` to `./other`, dropping the real local
+  taint summary.
+- Baseline matching is **case-insensitive on ruleId**, so a hand-edited baseline with `bcr-val-001`
+  still suppresses a `BCR-VAL-001` finding.
+
+### Fixed — Log / search correctness (round 3)
+- Free-text search reports the ES **matched-total** (`track_total_hits`) — `matchedTotal` /
+  `matchedTotalRelation` — distinct from the returned-count `totalHits`, so a capped result reads
+  "showing N of M matched" instead of mislabeling the page size as the total.
+- Log findings keep each excerpt and reported column **inside one coherent field**: matches in the
+  appended structured `_source` projection are labeled `[_source]` and reported at a field-relative
+  column, never at an offset that doesn't exist in Kibana's `message` field.
+
+### Fixed — CLI polish (round 3)
+- Default output filenames include the pid + a random suffix (not just `Date.now()`), so
+  same-millisecond runs can't clobber each other's report.
+- `--update-baseline` without `--baseline` co-locates the baseline with the scanned path for code
+  scans (logs/search still default to cwd); the resolved absolute path is logged.
+- stdout/stderr are drained before `process.exit`, so `--list-rules | jq` (and any piped output)
+  can't be truncated mid-write.
+- SARIF `artifactLocation.uri` emits a valid `file://` URI when a finding's file is on a different
+  Windows drive than the cwd (unrelativizable), instead of a drive-letter pseudo-URI.
+
 ## [1.2.0] — 2026-05-29
 
 ### Added — Cross-file workflow

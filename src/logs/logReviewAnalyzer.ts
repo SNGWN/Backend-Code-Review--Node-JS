@@ -57,8 +57,13 @@ export class LogReviewAnalyzer {
     try {
       for await (const hit of this.client.streamHits(searchOptions)) {
         this.hitsScanned += 1;
-        const line = hit.message;
+        let line = hit.message;
         if (!line) continue;
+        // Defence-in-depth cap: bound the line before running every rule regex over it. Log
+        // lines are attacker-influenced and unbounded; a single multi-megabyte line would
+        // otherwise amplify any super-linear regex across the whole rule set.
+        const MAX_LINE = 64 * 1024;
+        if (line.length > MAX_LINE) line = line.slice(0, MAX_LINE);
 
         const matches = scanLogLine(line);
         for (const match of matches) {

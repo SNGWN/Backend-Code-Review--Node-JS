@@ -39,8 +39,15 @@ const AUTHZ_CONTEXT_PATTERN =
 const OWNERSHIP_RESOURCE_PATTERN =
   /(owner|ownerid|userid|user_id|accountid|tenantid|organizationid|orgid|resource\.userid|resource\.ownerid)/i;
 const RATE_LIMIT_NAME_PATTERN = /(ratelimit|ratelimiter|limiter|throttle|throttler)/i;
+// Backend untrusted-input sources, each anchored with \b so a token never matches inside an
+// unrelated identifier. Removed the previous bare `payload`/`userdata`/`userinput` substrings
+// (they fired on `payloadType`, `userdataStore`, etc. when matched over whole-subtree text) and
+// the browser-only `window.`/`document.` tokens (irrelevant to a backend scanner — pure FP fuel).
+// Added microservice ingress shapes: gRPC `call.request`, Koa `ctx.request/ctx.req`, and raw
+// header access. Structural sources that depend on parameter POSITION (message-queue consumer
+// callbacks, GraphQL resolver `args`) are seeded in the TaintTracker, not matched here.
 const UNTRUSTED_INPUT_PATTERN =
-  /(req|request)\.(body|query|params|headers|cookies)|ctx\.request|userinput|userdata|payload|socket\.on\(|window\.|document\./i;
+  /\b(req|request)\.(body|query|params|headers|cookies|rawHeaders|originalUrl|url|hostname|ip|ips)\b|\bctx\.(request|req)\b|\b(userInput|userData)\b|\bsocket\.on\s*\(|\bcall\.request\b/i;
 // Anchor each name with \b so library tokens don't match inside unrelated identifiers
 // (e.g. `joi` inside `path.join`, `yup` inside `cleanup`, `zod` inside `lazod`).
 const VALIDATION_BOUNDARY_PATTERN =
@@ -249,20 +256,37 @@ export function getEnclosingScopeText(node: ts.Node, sourceFile: ts.SourceFile):
   let current: ts.Node | undefined = node;
 
   while (current) {
+    // Return the nearest enclosing FUNCTION body — the real handler scope. Previously this
+    // also returned on the innermost CallExpression, so for `foo(bar(req.params.id))` it
+    // yielded just `bar(...)` text and missed verification/ownership checks elsewhere in the
+    // handler. That single over-eager branch corrupted scope analysis in the auth, access-
+    // control, and JWT detectors (both false positives and missed checks).
     if (
       ts.isFunctionDeclaration(current) ||
       ts.isFunctionExpression(current) ||
       ts.isArrowFunction(current) ||
       ts.isMethodDeclaration(current) ||
-      ts.isCallExpression(current)
+      ts.isConstructorDeclaration(current)
     ) {
-      return current.getText(sourceFile).toLowerCase();
+      return stripComments(current.getText(sourceFile)).toLowerCase();
     }
 
     current = current.parent;
   }
 
-  return node.getText(sourceFile).toLowerCase();
+  return stripComments(node.getText(sourceFile)).toLowerCase();
+}
+
+/**
+ * Remove `//` and block comments before any heuristic text match. A scanner must never treat
+ * a comment as evidence of a real control: fixtures and real code routinely contain lines like
+ * `// TODO: check req.user.id === ownerId` that describe a MISSING check. Counting those as the
+ * check itself produces false negatives (the dangerous code is silently cleared).
+ */
+function stripComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
 }
 
 export function isUntrustedInputText(text: string): boolean {

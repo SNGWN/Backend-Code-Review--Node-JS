@@ -90,13 +90,37 @@ export class EventStreamDetector {
   }
 
   private checkTenantIsolation(node: ts.CallExpression): void {
-    const sourceText = node.getText(this.sourceFile);
+    // Require a real event-handler registration on an emitter/socket-like receiver, and a handler
+    // that actually performs a DB operation on sensitive-domain data without tenant scoping.
+    // The previous version fired on any `.on(...)` whose text merely contained a domain word.
+    const callee = node.expression;
+    if (!ts.isPropertyAccessExpression(callee)) return;
+    const method = callee.name.text.toLowerCase();
+    if (!/^(on|once|subscribe|addlistener)$/.test(method)) return;
+    const receiver = callee.expression.getText(this.sourceFile).toLowerCase();
+    if (!/\b(socket|io|emitter|eventemitter|bus|eventbus|stream|channel|subscriber|pubsub|ws|wss|connection|conn)\b/.test(receiver)) {
+      return;
+    }
 
-    const eventHandlerCall = /\.on\(|\.subscribe|EventEmitter|event\.on/.test(sourceText);
-    const likelySensitiveDomain = /user|account|profile|order|payment|billing|invoice/i.test(sourceText);
-    const hasTenantScope = /tenantId|tenant|org|workspace|accountId|scope/i.test(sourceText);
+    const handlerArg = node.arguments[node.arguments.length - 1];
+    let handlerText = '';
+    if (handlerArg && (ts.isArrowFunction(handlerArg) || ts.isFunctionExpression(handlerArg))) {
+      handlerText = handlerArg.getText(this.sourceFile);
+    } else if (handlerArg && ts.isIdentifier(handlerArg)) {
+      const fn =
+        ASTVisitor.findFunctionDeclarations(this.sourceFile, handlerArg.text)[0] ??
+        ASTVisitor.findVariableDeclarations(this.sourceFile, handlerArg.text).find(
+          (d) => d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))
+        )?.initializer;
+      handlerText = fn ? fn.getText(this.sourceFile) : '';
+    }
+    if (!handlerText) return;
 
-    if (!eventHandlerCall || !likelySensitiveDomain || hasTenantScope) {
+    const sensitiveDataOp =
+      /\b(db|database|model|models|repo|repository|prisma|knex|sequelize|collection)\b\s*\.\s*\w/i.test(handlerText) &&
+      /\b(user|account|profile|order|payment|billing|invoice|wallet|balance|transaction)\b/i.test(handlerText);
+    const hasTenantScope = /\b(tenantId|tenant|orgId|organisation|organization|workspace|accountId|ownerId|scope)\b/i.test(handlerText);
+    if (!sensitiveDataOp || hasTenantScope) {
       return;
     }
 
@@ -107,11 +131,13 @@ export class EventStreamDetector {
       column: 0,
       ruleId: 'BCR-EVT-003',
       severity: 'HIGH',
+      confidence: 'TENTATIVE',
+      verify: 'Confirm this event handler reads/writes another tenant’s data without an org/tenant scope.',
       category: 'EVENT_STREAM',
       title: 'Missing Tenant Scoping in Sensitive Event Handler',
       description:
         'Sensitive event handling appears unscoped by tenant/account context, which can enable cross-tenant event abuse.',
-      code: sourceText,
+      code: node.getText(this.sourceFile).substring(0, 120),
       recommendation:
         'Bind event channels and handler authorization checks to tenant/account context before processing.',
     });

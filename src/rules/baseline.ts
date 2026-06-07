@@ -47,7 +47,18 @@ export class Baseline {
     if (!this.loaded || !finding.fingerprint) {
       return undefined;
     }
-    return this.fingerprints.get(finding.fingerprint);
+    const entry = this.fingerprints.get(finding.fingerprint);
+    if (!entry) return undefined;
+    // Re-validate ruleId and file against the entry before suppressing. The fingerprint is a
+    // 64-bit truncated hash; a collision — or a hand-edited baseline — must not silently suppress
+    // an UNRELATED finding. When the entry carries ruleId/file (it always does for tool-written
+    // baselines), they must agree with the finding.
+    // Case-insensitive on ruleId: a hand-edited baseline with `bcr-val-001` must still match a
+    // finding emitted as `BCR-VAL-001` (rule ids are conventionally upper-case but the baseline is
+    // user-editable).
+    if (entry.ruleId && finding.ruleId && entry.ruleId.toUpperCase() !== finding.ruleId.toUpperCase()) return undefined;
+    if (entry.file && normalizePath(finding.file) !== normalizePath(entry.file)) return undefined;
+    return entry;
   }
 
   /**

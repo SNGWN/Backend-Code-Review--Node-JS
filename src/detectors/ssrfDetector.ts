@@ -71,10 +71,11 @@ export class SsrfDetector {
     const sinkName = this.getCallSinkName(call);
     if (!sinkName) return;
 
-    // Outbound HTTP sinks. Strict matches: `fetch(url)`, `axios(url)`, `axios.get(url)`,
-    // `got(url)`, `request(url)`, `http.get(url)`, `https.request(url)`, `superagent.get(url)`,
-    // `node-fetch` aliases. Anchored to known sink names rather than substring.
-    const outboundShape = /^(fetch|axios|got|request|superagent|undici)$|^(axios|got|http|https|client|httpClient|api)\.(get|post|put|delete|patch|head|request)$/i;
+    // Outbound HTTP sinks. Bare-callable clients (`fetch`/`got`/`ky`/`needle`/`axios`/…) and
+    // method calls on an http-client-shaped receiver. The receiver set includes common
+    // axios.create()/got.extend() instance names (client/httpClient/api/agent/instance/svc) so
+    // `const client = axios.create(); client.get(userUrl)` is covered. Anchored, not substring.
+    const outboundShape = /^(fetch|axios|got|ky|needle|request|superagent|undici|phin)$|^(axios|got|ky|needle|http|https|client|httpClient|httpclient|api|apiClient|agent|instance|svc|service|gateway|upstream)\.(get|post|put|delete|patch|head|request|stream)$/i;
     if (!outboundShape.test(sinkName)) return;
 
     const urlArg = call.arguments[0];

@@ -14,11 +14,23 @@ export class ASTParser {
     try {
       this.lastError = null;
       const content = fs.readFileSync(this.filePath, 'utf-8');
+      // Pass an explicit ScriptKind by extension. Without it, `.tsx`/`.jsx` are parsed as plain
+      // TS/JS, so JSX and bare generic arrows (`<T>(x) => x`) emit parse diagnostics and the file
+      // is silently skipped. `.js`/`.cjs`/`.mjs` parse as JS so TS-only syntax isn't mis-flagged.
+      const lower = this.filePath.toLowerCase();
+      const scriptKind = lower.endsWith('.tsx')
+        ? ts.ScriptKind.TSX
+        : lower.endsWith('.jsx')
+          ? ts.ScriptKind.JSX
+          : lower.endsWith('.js') || lower.endsWith('.cjs') || lower.endsWith('.mjs')
+            ? ts.ScriptKind.JS
+            : ts.ScriptKind.TS;
       this.sourceFile = ts.createSourceFile(
         this.filePath,
         content,
         ts.ScriptTarget.Latest,
-        true
+        true,
+        scriptKind
       );
       const diagnostics =
         (

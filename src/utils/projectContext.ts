@@ -161,28 +161,41 @@ export class ProjectContext {
         return { module: currentModule, exportedName: currentName, hops };
       }
 
-      // 2. Check if the target file re-exports the name through another module.
-      // Prefer a specific (named) re-export over a wildcard so that
-      // `export { foo } from './b'; export * from './a';` correctly resolves
-      // `foo` against `'./b'`, not `'./a'`.
-      const reExport =
-        targetSummary.reExports.find((r) => r.exportedName === currentName) ??
-        targetSummary.reExports.find((r) => r.exportedName === '*');
-      if (reExport) {
-        const nextName = reExport.exportedName === '*' ? currentName : reExport.upstreamName;
-        currentModule = reExport.fromModule;
-        currentName = nextName;
+      // 2. Resolution order mirrors ES module semantics, where a module's OWN explicit
+      //    binding shadows anything pulled in by `export *`:
+      //      (a) an explicit named re-export of `currentName` wins (intentional delegation);
+      //      (b) a LOCAL definition of `currentName` in this file shadows any wildcard —
+      //          previously the wildcard was tried before the local summary, so a file that
+      //          both defined `export function getId()` AND had `export * from './other'`
+      //          mis-resolved `getId` to `./other`, dropping the real local summary (M10);
+      //      (c) only then fall through a wildcard `export *` re-export.
+      const namedReExport = targetSummary.reExports.find((r) => r.exportedName === currentName);
+      if (namedReExport) {
+        currentModule = namedReExport.fromModule;
+        currentName = namedReExport.upstreamName;
         currentFromFile = targetFile;
         continue;
       }
 
-      // 3. Otherwise, look up the function summary in the target file.
-      const summary = targetSummary.functionSummaries.get(currentName);
+      const localSummary = targetSummary.functionSummaries.get(currentName);
+      if (localSummary) {
+        return { module: currentModule, exportedName: currentName, hops, summary: localSummary };
+      }
+
+      const wildcardReExport = targetSummary.reExports.find((r) => r.exportedName === '*');
+      if (wildcardReExport) {
+        // Name is unchanged across a `export *` hop; only the module changes.
+        currentModule = wildcardReExport.fromModule;
+        currentFromFile = targetFile;
+        continue;
+      }
+
+      // 3. No re-export and no local function summary — terminal (summary undefined).
       return {
         module: currentModule,
         exportedName: currentName,
         hops,
-        summary,
+        summary: undefined,
       };
     }
     return { module: currentModule, exportedName: currentName, hops };
@@ -336,28 +349,37 @@ export class ProjectContext {
     let passesParamToSink = false;
 
     if (node.body) {
-      // Walk return statements ONLY for this function's body, not nested function bodies.
-      // Previously a `return req.body.x` inside an inner `.map(x => req.body.x)` would
-      // falsely mark the OUTER function as returning tainted data.
-      const directReturns: ts.ReturnStatement[] = [];
-      const collectReturns = (n: ts.Node): void => {
-        if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
-            ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) {
-          // Don't descend into nested function bodies — their returns belong to that
-          // function, not this one.
-          return;
-        }
-        if (ts.isReturnStatement(n)) directReturns.push(n);
-        n.forEachChild(collectReturns);
-      };
-      node.body.forEachChild(collectReturns);
-      for (const ret of directReturns) {
-        const expr = ret.expression;
-        if (!expr) continue;
-        const text = expr.getText(node.getSourceFile());
-        if (isUntrustedInputText(text)) {
+      if (!ts.isBlock(node.body)) {
+        // Expression-bodied arrow: `(req) => req.params.id`. The body IS the returned value, so
+        // there is no ReturnStatement to collect — check it directly. (Previously these arrows got
+        // no return-taint summary at all.)
+        if (isUntrustedInputText(node.body.getText(node.getSourceFile()))) {
           returnsTaintedFromRequest = true;
-          break;
+        }
+      } else {
+        // Walk return statements ONLY for this function's body, not nested function bodies.
+        // Previously a `return req.body.x` inside an inner `.map(x => req.body.x)` would
+        // falsely mark the OUTER function as returning tainted data.
+        const directReturns: ts.ReturnStatement[] = [];
+        const collectReturns = (n: ts.Node): void => {
+          if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
+              ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) {
+            // Don't descend into nested function bodies — their returns belong to that
+            // function, not this one.
+            return;
+          }
+          if (ts.isReturnStatement(n)) directReturns.push(n);
+          n.forEachChild(collectReturns);
+        };
+        node.body.forEachChild(collectReturns);
+        for (const ret of directReturns) {
+          const expr = ret.expression;
+          if (!expr) continue;
+          const text = expr.getText(node.getSourceFile());
+          if (isUntrustedInputText(text)) {
+            returnsTaintedFromRequest = true;
+            break;
+          }
         }
       }
 

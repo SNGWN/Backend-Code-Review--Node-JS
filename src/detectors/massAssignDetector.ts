@@ -5,6 +5,7 @@ import { ASTParser } from '../parser/astParser';
 import { MassAssignmentPocGenerator } from '../poc/templates/MassAssignmentPocGenerator';
 import { PocGenerationRequest, PocGeneratorConfig } from '../poc/types';
 import { Logger } from '../utils/logger';
+import { isUserControlledExpression, getEnclosingScopeText } from '../utils/detectorLogic';
 
 export class MassAssignmentDetector {
   private findings: Finding[] = [];
@@ -27,10 +28,74 @@ export class MassAssignmentDetector {
     this.detectUnvalidatedFieldAssignment();
     this.detectMissingFieldWhitelisting();
     this.detectPrototypePollution();
+    this.detectDynamicPrototypePollution();
     this.detectConstructorInjection();
     this.detectMassAssignViaServiceCall();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * BCR-MA-007: prototype pollution via a DYNAMIC, user-controlled key. The literal-`__proto__`
+   * check (detectPrototypePollution) misses the real attack: `target[req.body.key] = value`,
+   * where the attacker simply sends `key = "__proto__"`. Also flags a recursive merge over
+   * request data. Suppressed when the enclosing scope guards the key (a `__proto__`/`constructor`
+   * comparison, a Map, or `Object.create(null)`).
+   */
+  private detectDynamicPrototypePollution(): void {
+    const guarded = (node: ts.Node): boolean => {
+      const scope = getEnclosingScopeText(node, this.sourceFile);
+      return /__proto__|constructor|prototype|hasownproperty|object\.create\(\s*null\s*\)|new map\(|\.set\(/i.test(scope);
+    };
+
+    // (1) Computed assignment: `obj[key] = value` with a user-controlled key.
+    ASTVisitor.findNodes(
+      this.sourceFile,
+      (node) => ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ).forEach((node) => {
+      const bin = node as ts.BinaryExpression;
+      if (!ts.isElementAccessExpression(bin.left)) return;
+      const key = bin.left.argumentExpression;
+      if (ts.isStringLiteralLike(key) || ts.isNumericLiteral(key)) return;
+      if (!isUserControlledExpression(key, this.sourceFile)) return;
+      if (guarded(bin)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(bin.getStart());
+      this.findings.push({
+        ruleId: 'BCR-MA-007',
+        category: 'MASS_ASSIGNMENT',
+        severity: 'HIGH',
+        title: 'Prototype Pollution via Dynamic Property Assignment',
+        description: 'A property is written with a user-controlled key and no guard against `__proto__`/`constructor`/`prototype`. An attacker can set the key to `__proto__` and pollute Object.prototype.',
+        file: this.filePath,
+        line,
+        column,
+        code: bin.getText().substring(0, 120),
+        recommendation: 'Reject keys equal to `__proto__`/`constructor`/`prototype`, or store in a Map / `Object.create(null)`.',
+      });
+    });
+
+    // (2) Recursive merge over request data: `merge(target, req.body)`.
+    ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
+      const name = ASTVisitor.getCallExpressionName(call) || '';
+      if (!/^(merge|mergeWith|deepMerge|deepmerge|extend|defaultsDeep|assignInWith|setWith)$/i.test(name)) return;
+      const hasTaintedArg = call.arguments.some((arg) => isUserControlledExpression(arg, this.sourceFile));
+      if (!hasTaintedArg || guarded(call)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      this.findings.push({
+        ruleId: 'BCR-MA-007',
+        category: 'MASS_ASSIGNMENT',
+        severity: 'HIGH',
+        title: 'Prototype Pollution via Recursive Merge of User Input',
+        description: 'A recursive merge/extend operates over user-controlled data. Without a hardened implementation, an attacker-supplied `__proto__` key pollutes Object.prototype.',
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 120),
+        recommendation: 'Use a prototype-pollution-safe merge, validate the payload against a schema first, or strip `__proto__`/`constructor`/`prototype` keys before merging.',
+      });
+    });
   }
 
   /**
@@ -120,21 +185,18 @@ export class MassAssignmentDetector {
 
     assignCalls.forEach((call) => {
       if (call.arguments.length >= 2) {
-        const sourceArg = call.arguments[1];
-        const sourceText = sourceArg.getText();
+        // Mass assignment requires the RAW request object (or a direct alias of it) — `req.body`,
+        // not a value that already passed through a whitelist/pick/validator function. Resolving
+        // through a function call would false-positive on `Object.assign({}, allow(req.body))`.
+        const sourceArg = call.arguments.slice(1).find((arg) => this.isRawRequestObject(arg));
 
-        if (
-          sourceText.includes('req.body') ||
-          sourceText.includes('req.query') ||
-          sourceText.includes('req.params') ||
-          sourceText.includes('input') ||
-          sourceText.includes('data')
-        ) {
+        if (sourceArg) {
           const { line, column } = this.parser.getLineAndColumn(call.getStart());
           const finding: Finding = {
             ruleId: 'BCR-MA-001',
             category: 'MASS_ASSIGNMENT',
             severity: 'CRITICAL',
+            confidence: 'CONFIRMED',
             title: 'Direct Object.assign with User Input',
             description: 'Object.assign is used with unvalidated user input, risking mass assignment attacks.',
             file: this.filePath,
@@ -156,35 +218,61 @@ export class MassAssignmentDetector {
     });
   }
 
+  /**
+   * True when `arg` is the raw request object (`req.body`/`req.query`/`req.params`) or a direct
+   * alias of it (`const b = req.body`). A value wrapped in a function call (pick/allow/validate)
+   * is NOT raw — that function may be a whitelist boundary — and returns false.
+   */
+  private isRawRequestObject(arg: ts.Expression): boolean {
+    const direct = /^(req|request|ctx\.request)\.(body|query|params)$/;
+    const text = arg.getText(this.sourceFile).trim();
+    if (direct.test(text)) return true;
+    if (ts.isIdentifier(arg)) {
+      return ASTVisitor.findVariableDeclarations(this.sourceFile, arg.text).some(
+        (d) => d.initializer && direct.test(d.initializer.getText(this.sourceFile).trim())
+      );
+    }
+    return false;
+  }
+
   private detectUnvalidatedFieldAssignment(): void {
     const binaryExpressions = ASTVisitor.findNodes(
       this.sourceFile,
       (node) => ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
     );
 
+    // Fields whose value coming straight from the client is a privilege-escalation / integrity
+    // concern. Assigning one of these from request data is the high-value mass-assignment shape.
+    const SENSITIVE_FIELD = /\b(role|roles|isadmin|admin|permission|permissions|scope|scopes|verified|isverified|active|status|balance|price|amount|credit|owner|ownerid|userid|tenantid|approved|enabled|level|tier|plan|grant)\b/i;
+
     binaryExpressions.forEach((node) => {
       const binExpr = node as ts.BinaryExpression;
-      const leftText = binExpr.left.getText();
-      const rightText = binExpr.right.getText();
+      // LHS must be a property write (`obj.field = ...`) and RHS must resolve to user input.
+      if (!ts.isPropertyAccessExpression(binExpr.left)) return;
+      const fieldName = binExpr.left.name.text;
+      const receiverText = binExpr.left.expression.getText(this.sourceFile);
+      // Skip writes onto the request/response objects themselves.
+      if (/^(req|request|res|response|ctx)\b/.test(receiverText)) return;
+      if (!isUserControlledExpression(binExpr.right, this.sourceFile)) return;
 
-      if (
-        (leftText.includes('user.') || leftText.includes('obj.')) &&
-        (rightText.includes('req.body') ||
-          rightText.includes('req.query') ||
-          rightText.includes('input'))
-      ) {
+      const sensitive = SENSITIVE_FIELD.test(fieldName);
+      {
         const { line, column } = this.parser.getLineAndColumn(binExpr.getStart());
         const finding: Finding = {
           ruleId: 'BCR-MA-002',
           category: 'MASS_ASSIGNMENT',
           severity: 'HIGH',
-          title: 'Unvalidated Field Assignment',
-          description: 'Object property directly assigned from user input without validation.',
+          // A sensitive target field (role/isAdmin/balance/…) is a confirmed escalation vector;
+          // any other field is reported for review rather than dropped.
+          confidence: sensitive ? 'CONFIRMED' : 'TENTATIVE',
+          verify: sensitive ? undefined : `Confirm assigning "${fieldName}" from request data is intended (not a privilege/integrity field).`,
+          title: sensitive ? 'Privileged Field Assigned Directly From User Input' : 'Unvalidated Field Assignment',
+          description: `Object property \`${fieldName}\` is assigned directly from user input without validation.`,
           file: this.filePath,
           line,
           column,
           code: binExpr.getText().substring(0, 60),
-          recommendation: 'Validate field names and values before assignment. Use a whitelist approach.',
+          recommendation: 'Validate field names and values before assignment. Use a whitelist approach; never let the client set privilege/role fields.',
         };
 
         // Generate POC

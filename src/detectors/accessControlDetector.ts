@@ -56,6 +56,7 @@ export class AccessControlDetector {
     this.detectMissingOwnershipVerification();
     this.detectPrivilegeEscalation();
     this.detectIdorVulnerabilities();
+    this.detectServiceLayerIdor();
 
     return { findings: this.findings };
   }
@@ -128,35 +129,55 @@ export class AccessControlDetector {
     });
 
     parameterAccess.forEach((node) => {
-      const nodeText = node.getText().toLowerCase();
+      if (!ts.isPropertyAccessExpression(node)) return;
+      const nodeText = node.getText();
       const context = getEnclosingScopeText(node, this.sourceFile);
-      const isResourceLookupContext = /(findbyid|getbyid|findone|where|query|delete|update|select)/.test(context);
+      // Word-boundary the sink verbs so `deletedId` / `updatedAt` don't count as a delete/update
+      // resource-lookup context (substring matching produced false positives).
+      const isResourceLookupContext = /\b(findbyid|getbyid|findone|where|query|delete|update|select|findunique|findfirst)\b/.test(context);
 
-      // Check if the ID is used directly without ownership verification
+      // Check if the ID is used directly without ownership verification. NOTE: this reads the
+      // enclosing function scope; auth/ownership enforced purely in route middleware
+      // (`requireAuth`, `@UseGuards`) is not visible here, which is why ambiguous ids report
+      // TENTATIVE rather than failing the build.
       const hasOwnershipGuard = hasOwnershipCheck(context);
+      if (!isResourceLookupContext || hasOwnershipGuard) return;
 
-      if (
-        isResourceLookupContext &&
-        !hasOwnershipGuard &&
-        (nodeText.includes('userid') || nodeText.includes('orderid') || nodeText.includes('invoiceid'))
-      ) {
-        const { line, column } = this.parser.getLineAndColumn(node.getStart());
-        const finding: Finding = {
-          ruleId: 'BCR-AC-002',
-          category: 'ACCESS_CONTROL',
-          severity: 'CRITICAL',
-          title: 'BOLA: Predictable ID Used Without Ownership Check',
-          description: `The ${nodeText} parameter is accessed directly without verifying that the current user owns this resource. Attackers can enumerate IDs and access other users' data.`,
-          file: this.filePath,
-          line,
-          column,
-          code: node.getText(),
-          recommendation: 'Always verify that the authenticated user owns the resource before returning it. Check ownership by comparing the resource owner ID with the current user ID.',
-        };
+      // Generalised id-parameter detection (was hardcoded to userid/orderid/invoiceid). A strong
+      // id shape (`id`, `userId`, `user_id`, `userID`) reports at FIRM; an ambiguous all-lowercase
+      // word ending in "id" (`userid`) reports at TENTATIVE with a verify note rather than being
+      // dropped — so the user decides instead of the tool silently hiding it.
+      const segment = node.name.text;
+      // A *named* id (`userId`, `user_id`, `accountID`) is a strong BOLA signal → FIRM. A bare
+      // `id` or an all-lowercase word ending in "id" (`userid`) is ambiguous → TENTATIVE.
+      const isNamedId = segment !== 'id' && /(_id$|Id$|ID$)/.test(segment);
+      const isLooseId =
+        segment === 'id' ||
+        (/^[a-z][a-z]*id$/.test(segment) &&
+          !/^(valid|rapid|grid|android|hybrid|solid|void|paid|said|mid|kid|lid|bid|aid|raid|fluid|liquid|candid|squid|avoid|overrid)$/.test(segment));
+      if (!isNamedId && !isLooseId) return;
+      const isStrongId = isNamedId;
 
-        this.findings.push(finding);
-        this.generateAccessControlPoc(finding, node.getText(), line);
-      }
+      const { line, column } = this.parser.getLineAndColumn(node.getStart());
+      const finding: Finding = {
+        ruleId: 'BCR-AC-002',
+        category: 'ACCESS_CONTROL',
+        severity: 'CRITICAL',
+        confidence: isStrongId ? 'FIRM' : 'TENTATIVE',
+        verify: isStrongId
+          ? 'Confirm the resource is loaded by this client-supplied id without an ownership/tenant check.'
+          : `Confirm "${segment}" is a resource identifier (not a flag/boolean) loaded without an ownership check.`,
+        title: 'BOLA: Predictable ID Used Without Ownership Check',
+        description: `The ${nodeText} parameter is accessed directly without verifying that the current user owns this resource. Attackers can enumerate IDs and access other users' data.`,
+        file: this.filePath,
+        line,
+        column,
+        code: node.getText(),
+        recommendation: 'Always verify that the authenticated user owns the resource before returning it. Check ownership by comparing the resource owner ID with the current user ID.',
+      };
+
+      this.findings.push(finding);
+      this.generateAccessControlPoc(finding, node.getText(), line);
     });
   }
 
@@ -295,6 +316,78 @@ export class AccessControlDetector {
           this.generateAccessControlPoc(finding, node.getText(), line);
         }
       }
+    });
+  }
+
+  /**
+   * Detects IDOR that crosses into the SERVICE / REPOSITORY layer (M44).
+   *
+   * The single-file BOLA/IDOR passes above only see the DB-shaped sink names (`findById`, `where`,
+   * …). A controller that delegates to `this.accountService.getAccount(req.params.id)` hides the
+   * actual query behind a method call — the ownership check (if any) lives in another file this
+   * pass can't see. Rather than drop coverage, we surface the call when:
+   *   - the receiver looks like a service/repository/data-access object,
+   *   - the method is a single-resource lookup/mutation verb,
+   *   - the first argument is a client-supplied identifier, AND
+   *   - NO ownership/tenant context is passed alongside it and none is checked in this scope.
+   * Reported at TENTATIVE with a `verify` note — the ownership guard may legitimately live inside
+   * the service, so the USER confirms rather than the tool silently hiding or asserting it.
+   */
+  private detectServiceLayerIdor(): void {
+    const calls = ASTVisitor.findNodes(this.sourceFile, (node) => ts.isCallExpression(node)) as ts.CallExpression[];
+
+    calls.forEach((call) => {
+      const expr = call.expression;
+      if (!ts.isPropertyAccessExpression(expr)) return;
+      const method = expr.name.text;
+      const receiverText = expr.expression.getText(this.sourceFile);
+      const receiverBase = receiverText.replace(/^this\./, '');
+
+      // Receiver must look like a service / repository / data-access collaborator.
+      const receiverIsServiceLike = /(service|repository|repo|dao|store|manager|provider|gateway|datasource)$/i.test(receiverBase);
+      // Method must be a single-resource lookup or mutation verb.
+      const isLookupVerb = /^(get|find|fetch|load|read|retrieve|lookup|select|delete|remove|update|patch|modify|edit)/i.test(method);
+      if (!receiverIsServiceLike || !isLookupVerb) return;
+      // Names already covered (at CRITICAL) by detectIdorVulnerabilities — don't double-report.
+      if (/^(findById|getById|getOne|findOne)$/i.test(method)) return;
+
+      const args = call.arguments;
+      if (args.length === 0) return;
+      // First argument must be a client-supplied identifier.
+      if (!isUserControlledExpression(args[0], this.sourceFile)) return;
+      // If ANY argument carries ownership/tenant context, the service is most likely scoping the
+      // query to the caller — not an IDOR.
+      const passesOwnershipContext = args.some((arg) =>
+        /\b(req\.user|currentuser|user[_-]?id|owner|owner[_-]?id|tenant|tenant[_-]?id|org[_-]?id|organization[_-]?id|account[_-]?id)\b/i.test(
+          arg.getText(this.sourceFile)
+        )
+      );
+      if (passesOwnershipContext) return;
+
+      const scopeText = getEnclosingScopeText(call, this.sourceFile);
+      if (hasOwnershipCheck(scopeText)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      // Dedup: another access-control pass may have already flagged this line.
+      if (this.findings.some((f) => f.line === line && f.category === 'ACCESS_CONTROL')) return;
+
+      const finding: Finding = {
+        ruleId: 'BCR-AC-005',
+        category: 'ACCESS_CONTROL',
+        severity: 'HIGH',
+        confidence: 'TENTATIVE',
+        verify: `Confirm '${receiverBase}.${method}()' enforces an ownership/tenant scope inside the service/repository implementation — the controller passes only a client-supplied id with no owner context.`,
+        title: 'IDOR via Service/Repository Layer Without Visible Ownership Check',
+        description: `'${receiverBase}.${method}()' is invoked with a user-supplied identifier and no ownership/tenant argument. If the ${receiverBase} layer does not itself scope the query to the authenticated caller, an attacker can read or modify another tenant's resource by changing the id.`,
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 80),
+        recommendation: 'Pass the authenticated user/tenant id into the service call and enforce ownership in the underlying query (e.g. WHERE owner_id = :currentUser), or verify ownership on the returned object before use.',
+      };
+
+      this.findings.push(finding);
+      this.generateAccessControlPoc(finding, call.getText(), line);
     });
   }
 

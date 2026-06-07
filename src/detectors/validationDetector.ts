@@ -14,6 +14,40 @@ import { TaintTracker } from '../utils/taint';
 import { buildImportAliasMap, ImportAlias, resolveCalleeToExportedName } from '../utils/importAliases';
 import { ProjectContext } from '../utils/projectContext';
 
+const ONE_WAY_TRANSFORM = /^(hash|hashSync|createHash|createHmac|hmac|encrypt|sign|digest|bcrypt|scrypt|pbkdf2|pbkdf2Sync|argon2|randomBytes|randomUUID|uuid|genSalt|genSaltSync)$/i;
+
+/**
+ * True when `node` is (or ends in) a one-way transform call — hashing/HMAC/encryption/signing/
+ * random derivation. The output is not attacker-controllable in the injection sense even though a
+ * tainted value flows in, so a variable bound to it must not be treated as an injection source.
+ * Walks the call/property/await chain so `crypto.createHash('x').update(t).digest('hex')` matches
+ * on either `createHash` or `digest`.
+ */
+function isOneWayTransformExpr(node: ts.Expression): boolean {
+  let current: ts.Node | undefined = node;
+  let depth = 0;
+  while (current && depth < 12) {
+    if (ts.isCallExpression(current)) {
+      const callee = current.expression;
+      const name = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : ts.isIdentifier(callee)
+          ? callee.text
+          : '';
+      if (ONE_WAY_TRANSFORM.test(name)) return true;
+      current = ts.isPropertyAccessExpression(callee) ? callee.expression : callee;
+    } else if (ts.isPropertyAccessExpression(current)) {
+      current = current.expression;
+    } else if (ts.isAwaitExpression(current) || ts.isParenthesizedExpression(current)) {
+      current = current.expression;
+    } else {
+      break;
+    }
+    depth += 1;
+  }
+  return false;
+}
+
 /**
  * Parameter Validation Detector
  *
@@ -80,8 +114,223 @@ export class ParameterValidationDetector {
     this.buildTaintMap();
     this.detectDangerousSinkUsage();
     this.detectTaggedTemplateSqlInjection();
+    this.detectNoSqlInjection();
+    this.detectOrmRawSqlInjection();
+    this.detectServerSideTemplateInjection();
+    this.detectXxe();
 
     return { findings: this.findings };
+  }
+
+  /**
+   * NoSQL (MongoDB/Mongoose) operator injection. Dangerous shapes:
+   *   (a) a raw tainted value passed as the query filter — `User.find(req.query)`;
+   *   (b) an object literal whose value is tainted and NOT coerced to a primitive —
+   *       `User.find({ name: req.body.name })` (attacker sends `{"$gt":""}`);
+   *   (c) a `$where` / `$function` string built from tainted input → server-side JS (CRITICAL).
+   * Coerced values (`String(x)`, `Number(x)`, `` `${x}` ``) are treated as safe from operator
+   * injection and do not fire.
+   */
+  private detectNoSqlInjection(): void {
+    const NOSQL_METHODS = /^(find|findOne|findOneAndUpdate|findOneAndReplace|findOneAndDelete|findById|findByIdAndUpdate|update|updateOne|updateMany|deleteOne|deleteMany|remove|count|countDocuments|aggregate|distinct)$/i;
+    ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
+      const expr = call.expression;
+      if (!ts.isPropertyAccessExpression(expr)) return;
+      if (!NOSQL_METHODS.test(expr.name.text)) return;
+
+      const receiver = expr.expression.getText(this.sourceFile);
+      const modelLike =
+        /^[A-Z][A-Za-z0-9_]*$/.test(receiver) ||
+        /\.(collection|model)\s*\(/.test(receiver) ||
+        /\b(db|database|mongo|mongoose|model|models|collection|repository|repo)\b/i.test(receiver);
+      if (!modelLike) return;
+
+      const arg = call.arguments[0];
+      if (!arg || this.hasValidationInContext(call)) return;
+
+      let dangerous = false;
+      let serverSideJs = false;
+
+      if ((ts.isIdentifier(arg) || ts.isPropertyAccessExpression(arg)) && this.isTaintedUncoerced(arg)) {
+        dangerous = true;
+      } else if (ts.isObjectLiteralExpression(arg)) {
+        for (const prop of arg.properties) {
+          if (!ts.isPropertyAssignment(prop)) continue;
+          const keyText = prop.name.getText(this.sourceFile).replace(/['"`]/g, '');
+          if (/^\$(where|function)$|mapReduce/i.test(keyText) && this.referencesTaintedInput(prop.initializer)) {
+            dangerous = true;
+            serverSideJs = true;
+          } else if (this.isTaintedUncoerced(prop.initializer)) {
+            dangerous = true;
+          }
+        }
+      }
+
+      if (!dangerous) return;
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      this.findings.push({
+        ruleId: 'BCR-VAL-013',
+        category: 'VALIDATION',
+        severity: serverSideJs ? 'CRITICAL' : 'HIGH',
+        confidence: 'CONFIRMED',
+        title: serverSideJs
+          ? 'NoSQL Injection via $where Server-Side JavaScript'
+          : 'NoSQL Injection via Unsanitized Operator Object',
+        description: serverSideJs
+          ? 'A $where/$function clause embeds user-controlled input, allowing server-side JavaScript execution inside the database.'
+          : 'User-controlled input reaches a MongoDB query without primitive coercion. An attacker can inject operator objects ($gt/$ne/$regex) to bypass the filter.',
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 120),
+        recommendation: 'Coerce values to the expected primitive (String/Number) or validate against a schema before querying. Never pass req.body/req.query objects directly as a filter.',
+      });
+    });
+  }
+
+  /**
+   * ORM/query-builder raw-SQL sinks (TypeORM/Knex/Sequelize/Prisma). The generic SQL sink
+   * only fires when the argument literally contains a SQL keyword, so it misses
+   * `qb.whereRaw('age > ' + req.query.age)` (the WHERE is implicit in the method name).
+   */
+  private detectOrmRawSqlInjection(): void {
+    const RAW_METHODS = /^(whereRaw|havingRaw|orderByRaw|groupByRaw|joinRaw|fromRaw|selectRaw|queryRawUnsafe|executeRawUnsafe)$/i;
+    const BUILDER_WHERE = /^(where|andWhere|orWhere|having|andHaving|orHaving)$/i;
+    const ORM_RECEIVER = /\b(knex|qb|queryBuilder|builder|trx|tx|db|database|repository|repo|datasource|manager|entityManager|connection|conn|sequelize|prisma)\b/i;
+
+    ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
+      const expr = call.expression;
+      if (!ts.isPropertyAccessExpression(expr)) return;
+      const method = expr.name.text;
+      const receiver = expr.expression.getText(this.sourceFile);
+      const ormReceiver = ORM_RECEIVER.test(receiver) || /createQueryBuilder|getRepository|\$queryRaw|\$executeRaw/i.test(receiver);
+      const arg = call.arguments[0];
+      if (!arg || this.hasValidationInContext(call)) return;
+
+      const isConstructedString =
+        ts.isTemplateExpression(arg) ||
+        (ts.isBinaryExpression(arg) && arg.operatorToken.kind === ts.SyntaxKind.PlusToken) ||
+        this.argIsTaintedSqlVariable(arg);
+
+      let dangerous = false;
+      if (RAW_METHODS.test(method) && ormReceiver) {
+        // Raw methods carry implicit SQL — any tainted, dynamically-built argument is injectable.
+        dangerous = isConstructedString && this.referencesTaintedInput(arg);
+      } else if (BUILDER_WHERE.test(method) && ormReceiver) {
+        // Non-raw where clauses are only dangerous when built by string concatenation/interpolation
+        // (the object/parameterized forms are safe).
+        dangerous = isConstructedString && this.referencesTaintedInput(arg);
+      }
+      if (!dangerous) return;
+
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      this.findings.push({
+        ruleId: 'BCR-VAL-001',
+        category: 'VALIDATION',
+        severity: 'CRITICAL',
+        title: 'Unvalidated Input Reaches SQL Query Construction',
+        description: 'User-controlled input is concatenated into a raw ORM/query-builder SQL fragment. This is directly exploitable for SQL injection.',
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 120),
+        recommendation: 'Use parameter bindings (`?` / `:name`) instead of string concatenation. For raw fragments, pass values via the bindings array, never interpolated into the SQL text.',
+      });
+    });
+  }
+
+  /**
+   * Server-Side Template Injection: a template engine compiles/renders a template STRING that
+   * is built from user input. Escalates to RCE in most engines. Note this targets the template
+   * SOURCE being tainted (handlebars.compile(req.body.tpl)), not tainted context data.
+   */
+  private detectServerSideTemplateInjection(): void {
+    const ENGINE = /^(handlebars|hbs|Handlebars|pug|jade|ejs|nunjucks|_|lodash|dot|doT|eta|Eta|mustache|Mustache|twig|liquid|Liquid|art|template)$/;
+    const COMPILE = /^(compile|compileFile|renderString|template)$/i;
+    ASTVisitor.findCallExpressions(this.sourceFile).forEach((call) => {
+      const expr = call.expression;
+      let receiver = '';
+      let method = '';
+      if (ts.isPropertyAccessExpression(expr)) {
+        receiver = ts.isIdentifier(expr.expression) ? expr.expression.text : expr.expression.getText(this.sourceFile);
+        method = expr.name.text;
+      } else if (ts.isIdentifier(expr)) {
+        method = expr.text;
+      } else {
+        return;
+      }
+      if (!COMPILE.test(method)) return;
+      const isTemplateEngine = ENGINE.test(receiver) || (method.toLowerCase() === 'renderstring');
+      if (!isTemplateEngine) return;
+
+      const arg = call.arguments[0];
+      if (!arg || !this.referencesTaintedInput(arg) || this.hasValidationInContext(call)) return;
+
+      const { line, column } = this.parser.getLineAndColumn(call.getStart());
+      this.findings.push({
+        ruleId: 'BCR-VAL-014',
+        category: 'VALIDATION',
+        severity: 'CRITICAL',
+        confidence: 'CONFIRMED',
+        title: 'Server-Side Template Injection (SSTI)',
+        description: 'A template engine compiles a template string derived from user-controlled input. SSTI commonly escalates to remote code execution.',
+        file: this.filePath,
+        line,
+        column,
+        code: call.getText().substring(0, 120),
+        recommendation: 'Keep templates static. Pass user data only as bound context values; never compile a template from request data.',
+      });
+    });
+  }
+
+  /**
+   * XXE: an XML parser is explicitly configured to resolve external entities. The config flag
+   * itself is the vulnerability — any XML parsed afterwards becomes dangerous (file read, SSRF,
+   * billion-laughs DoS).
+   */
+  private detectXxe(): void {
+    const objects = ASTVisitor.findNodes(this.sourceFile, (n) => ts.isObjectLiteralExpression(n)) as ts.ObjectLiteralExpression[];
+    objects.forEach((obj) => {
+      for (const prop of obj.properties) {
+        if (!ts.isPropertyAssignment(prop)) continue;
+        const key = prop.name.getText(this.sourceFile).replace(/['"`]/g, '');
+        const valueText = prop.initializer.getText(this.sourceFile);
+        if (/^(noent|resolveExternals|replaceEntities|externalEntities|loadExternalDtd)$/i.test(key) && /^true$/i.test(valueText)) {
+          const { line, column } = this.parser.getLineAndColumn(prop.getStart());
+          this.findings.push({
+            ruleId: 'BCR-VAL-015',
+            category: 'VALIDATION',
+            severity: 'HIGH',
+            confidence: 'CONFIRMED',
+            title: 'XML External Entity (XXE) Expansion Enabled',
+            description: `XML parser option \`${key}: true\` enables external-entity / DTD resolution. Parsing attacker XML allows file disclosure, SSRF, and denial of service.`,
+            file: this.filePath,
+            line,
+            column,
+            code: obj.getText(this.sourceFile).substring(0, 120),
+            recommendation: 'Disable external entity and DTD processing (e.g. `{ noent: false, nonet: true }`) and avoid parsing XML from untrusted sources.',
+          });
+          break;
+        }
+      }
+    });
+  }
+
+  /**
+   * True when `expr` is attacker-controlled AND is not coerced to a primitive. Primitive
+   * coercion (String/Number/parseInt/parseFloat/Boolean, `.toString()`, template/concat) makes
+   * a value safe from NoSQL operator injection.
+   */
+  private isTaintedUncoerced(expr: ts.Expression): boolean {
+    if (!this.referencesTaintedInput(expr)) return false;
+    if (ts.isCallExpression(expr)) {
+      const name = ASTVisitor.getCallExpressionName(expr) || '';
+      if (/^(String|Number|parseInt|parseFloat|Boolean)$/.test(name)) return false;
+      if (ts.isPropertyAccessExpression(expr.expression) && /^(toString|toHexString)$/.test(expr.expression.name.text)) return false;
+    }
+    if (ts.isTemplateExpression(expr)) return false;
+    if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.PlusToken) return false;
+    return true;
   }
 
   /**
@@ -173,6 +422,15 @@ export class ParameterValidationDetector {
         return;
       }
 
+      // A one-way transform of a tainted value (hash/HMAC/encrypt/sign/random derivation) yields a
+      // non-injectable output. The crude text match above sees `req.body.x` inside
+      // `crypto.createHash(..).update(req.body.x).digest()` and would otherwise mark the digest
+      // tainted — mark it validated instead so downstream sinks don't false-positive.
+      if (isOneWayTransformExpr(initializer)) {
+        if (ts.isIdentifier(declaration.name)) this.validatedVariables.add(declaration.name.text);
+        return;
+      }
+
       if (ts.isIdentifier(declaration.name)) {
         this.taintedVariables.add(declaration.name.text);
         return;
@@ -210,6 +468,9 @@ export class ParameterValidationDetector {
         ruleId: sink.ruleId,
         category: 'VALIDATION',
         severity: sink.severity,
+        // This path only fires when an argument references tainted input and no validation
+        // boundary covers it — a confirmed source→sink flow.
+        confidence: 'CONFIRMED',
         title: sink.title,
         description: sink.description,
         file: this.filePath,
@@ -261,6 +522,10 @@ export class ParameterValidationDetector {
 
     // The argument must look like a SQL string: interpolated AND contain SQL keywords
     // (kept from original logic). For template literals, also check the head text.
+    // Additionally (H14/H25): catch the very common shape where the query string is built in
+    // a separate variable and passed as a bare identifier — `const q = 'SELECT…'+id; db.query(q)`.
+    // The previous gate only saw inline interpolation and silently dropped the variable case
+    // even though the taint engine already knew `q` was attacker-controlled.
     const hasInterpolatedQueryArg = callExpr.arguments.some((arg) => {
       if (ts.isTemplateExpression(arg)) {
         const fullText = arg.getText(this.sourceFile);
@@ -273,7 +538,7 @@ export class ParameterValidationDetector {
       ) {
         return true;
       }
-      return false;
+      return this.argIsTaintedSqlVariable(arg);
     });
 
     if (sqlCallNamePattern.test(callName) && dbLikeReceiver && hasInterpolatedQueryArg) {
@@ -353,6 +618,29 @@ export class ParameterValidationDetector {
     return null;
   }
 
+
+  /**
+   * True when `arg` is a tainted identifier whose declaration initializer is a SQL string built
+   * by concatenation/interpolation. Covers `const q = 'SELECT … '+id; db.query(q)` — the
+   * query-in-a-variable shape that inline-only matching misses. Parameterized calls
+   * (`db.query('SELECT … ?', [id])`) are unaffected: the first arg is a constant string literal
+   * (not an identifier) and the params array is not a SQL string.
+   */
+  private argIsTaintedSqlVariable(arg: ts.Expression): boolean {
+    if (!ts.isIdentifier(arg)) return false;
+    if (!this.referencesTaintedInput(arg)) return false;
+    const declarations = ASTVisitor.findVariableDeclarations(this.sourceFile, arg.text);
+    return declarations.some((declaration) => {
+      const initializer = declaration.initializer;
+      if (!initializer) return false;
+      const text = initializer.getText(this.sourceFile);
+      const looksLikeSql = /\b(select|insert|update|delete|from|where|join|having|union)\b/i.test(text);
+      const isConstructed =
+        ts.isTemplateExpression(initializer) ||
+        (ts.isBinaryExpression(initializer) && initializer.operatorToken.kind === ts.SyntaxKind.PlusToken);
+      return looksLikeSql && isConstructed;
+    });
+  }
 
   private referencesTaintedInput(node: ts.Node): boolean {
     // Walk the node for any identifier whose declaration we marked tainted via
