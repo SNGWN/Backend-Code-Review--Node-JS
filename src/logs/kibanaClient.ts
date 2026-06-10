@@ -13,6 +13,20 @@ export function scrubCredentialsFromUrl(value: string): string {
 }
 
 /**
+ * Decides whether the Authorization header may be sent to `targetUrl` when the client was
+ * configured for `baseUrl`. Same origin always forwards. A same-host http→https UPGRADE also
+ * forwards — LB/SSO gateways commonly answer plain-http requests with a 301 to the TLS endpoint,
+ * and stripping auth there would turn the redirect feature into a guaranteed 401. Never forwards
+ * on a downgrade (https→http) or to a different host.
+ */
+export function shouldForwardAuth(baseUrl: string, targetUrl: string): boolean {
+  const base = new URL(baseUrl);
+  const target = new URL(targetUrl);
+  if (base.origin === target.origin) return true;
+  return base.protocol === 'http:' && target.protocol === 'https:' && base.hostname === target.hostname;
+}
+
+/**
  * Minimal Elasticsearch / Kibana search client.
  *
  * Two transport modes:
@@ -89,7 +103,8 @@ export interface KibanaClientConfig {
   /**
    * Maximum redirect hops to follow (default 5). Kibana behind a load balancer / SSO
    * gateway often answers 301/302/307/308 (http→https upgrade, trailing-slash, host
-   * canonicalization). Authorization is forwarded only on same-origin redirects.
+   * canonicalization). Authorization is forwarded on same-origin hops and same-host
+   * http→https upgrades only — see `shouldForwardAuth`.
    */
   maxRedirects?: number;
 }
@@ -212,6 +227,10 @@ export class KibanaClient {
             'utf-8'
           ).toString('base64')}`
         : null;
+      // Strip the credential from the stored URL object — it lives on only inside the prebuilt
+      // header, so heap snapshots / debug dumps of the client never carry the raw password.
+      parsed.username = '';
+      parsed.password = '';
     } else {
       this.proxy = null;
       this.proxyAuthHeader = null;
@@ -571,21 +590,20 @@ export class KibanaClient {
    * Redirect semantics:
    *   - 301 / 302 / 303 on POST → re-issue as GET without the body (de-facto client behavior;
    *     303 mandates it). 307 / 308 preserve method + body.
-   *   - The Authorization header is forwarded ONLY when the redirect target has the same
-   *     origin (scheme + host + port) as the original base URL — a cross-origin redirect
-   *     must never receive the Kibana/ES credential.
+   *   - The Authorization header is forwarded only when `shouldForwardAuth` allows it:
+   *     same origin, or a same-host http→https upgrade. A true cross-origin redirect
+   *     (different host, or a TLS downgrade) never receives the Kibana/ES credential.
    *   - Redirect loops / over-long chains fail with the (credential-scrubbed) chain in the error.
    */
   private async request(method: string, urlString: string, body?: unknown): Promise<{ status: number; body: string }> {
-    const origin = new URL(this.baseUrl).origin;
     let currentMethod = method;
     let currentUrl = urlString;
     let currentBody = body;
     const visited: string[] = [];
 
     for (let hop = 0; hop <= this.maxRedirects; hop++) {
-      const sameOrigin = new URL(currentUrl).origin === origin;
-      const result = await this.requestOnce(currentMethod, currentUrl, currentBody, sameOrigin);
+      const forwardAuth = shouldForwardAuth(this.baseUrl, currentUrl);
+      const result = await this.requestOnce(currentMethod, currentUrl, currentBody, forwardAuth);
 
       const isRedirect =
         result.status === 301 || result.status === 302 || result.status === 303 ||

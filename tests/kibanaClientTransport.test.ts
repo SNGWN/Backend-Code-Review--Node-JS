@@ -1,6 +1,6 @@
 import * as http from 'http';
 import { AddressInfo } from 'net';
-import { KibanaClient } from '../src/logs/kibanaClient';
+import { KibanaClient, shouldForwardAuth } from '../src/logs/kibanaClient';
 
 /**
  * Transport behavior of the KibanaClient against real local HTTP servers:
@@ -94,6 +94,26 @@ describe('KibanaClient redirects', () => {
   });
 });
 
+describe('shouldForwardAuth (redirect credential policy)', () => {
+  test('forwards on the same origin', () => {
+    expect(shouldForwardAuth('https://kibana.bank.ae:5601', 'https://kibana.bank.ae:5601/api/status')).toBe(true);
+  });
+
+  test('forwards on a same-host http→https upgrade (LB/SSO gateway pattern)', () => {
+    expect(shouldForwardAuth('http://kibana.bank.ae', 'https://kibana.bank.ae/api/status')).toBe(true);
+    expect(shouldForwardAuth('http://kibana.bank.ae:5601', 'https://kibana.bank.ae:443/api/status')).toBe(true);
+  });
+
+  test('never forwards on a TLS downgrade', () => {
+    expect(shouldForwardAuth('https://kibana.bank.ae', 'http://kibana.bank.ae/api/status')).toBe(false);
+  });
+
+  test('never forwards to a different host', () => {
+    expect(shouldForwardAuth('https://kibana.bank.ae', 'https://evil.example.com/api/status')).toBe(false);
+    expect(shouldForwardAuth('http://kibana.bank.ae', 'https://evil.example.com/api/status')).toBe(false);
+  });
+});
+
 describe('KibanaClient forward proxy', () => {
   test('routes http-target requests through the proxy as absolute-URI', async () => {
     const upstream = http.createServer((_req, res) => {
@@ -151,5 +171,17 @@ describe('KibanaClient forward proxy', () => {
   test('rejects an invalid proxy URL at construction', () => {
     expect(() => makeClient('http://127.0.0.1:9200', { proxyUrl: 'not a url' })).toThrow(/proxy/i);
     expect(() => makeClient('http://127.0.0.1:9200', { proxyUrl: 'ftp://proxy:21' })).toThrow(/http or https/);
+  });
+
+  test('does not retain raw proxy credentials on the stored URL object', () => {
+    const client = makeClient('http://127.0.0.1:9200', {
+      proxyUrl: 'http://secretuser:secretpass@127.0.0.1:8080',
+    });
+    // The credential must survive only inside the prebuilt Proxy-Authorization header,
+    // never on the long-lived URL object (heap snapshots / debug dumps).
+    const stored = (client as unknown as { proxy: URL }).proxy;
+    expect(stored.username).toBe('');
+    expect(stored.password).toBe('');
+    expect(stored.href).not.toContain('secretpass');
   });
 });
