@@ -51,7 +51,7 @@ export class InsecureTransportDetector {
       if (!ts.isPropertyAssignment(prop)) continue;
       const name = this.propName(prop.name);
       if (name !== 'rejectUnauthorized') continue;
-      if (prop.initializer.kind !== ts.SyntaxKind.FalseKeyword) continue;
+      if (!this.isFalsyLiteral(prop.initializer)) continue;
 
       this.emit(prop, {
         ruleId: 'BCR-TLS-001',
@@ -109,6 +109,21 @@ export class InsecureTransportDetector {
   private isZeroLiteral(expr: ts.Expression): boolean {
     if (ts.isStringLiteralLike(expr)) return expr.text.trim() === '0';
     if (ts.isNumericLiteral(expr)) return expr.text === '0';
+    return false;
+  }
+
+  /**
+   * Falsy literal that disables certificate validation: `false`, `0`, `'0'`, `'false'`, `''`.
+   * People reach for the numeric/string variants when copy-pasting workarounds; all of them
+   * coerce to a disabled check. A non-literal (e.g. `rejectUnauthorized: isProd`) is left alone.
+   */
+  private isFalsyLiteral(expr: ts.Expression): boolean {
+    if (expr.kind === ts.SyntaxKind.FalseKeyword) return true;
+    if (ts.isNumericLiteral(expr)) return Number(expr.text) === 0;
+    if (ts.isStringLiteralLike(expr)) {
+      const v = expr.text.trim().toLowerCase();
+      return v === '0' || v === 'false' || v === '';
+    }
     return false;
   }
 

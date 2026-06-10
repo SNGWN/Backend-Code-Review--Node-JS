@@ -2,7 +2,33 @@ import * as fs from 'fs';
 import { AnalysisReport, Confidence, Finding, IssueCategory, RuntimeIssue, RuntimeIssueType, Severity } from './types';
 import { Logger } from './utils/logger';
 
+/**
+ * Actionable remediation per runtime-issue type. When a scan hits an error (a file that
+ * won't parse, a detector that throws, a bad target path), the user needs to know not just
+ * *that* it happened but *how to fix it*. This maps each machine-readable type to a concrete
+ * next step shown alongside the raw error message.
+ */
+const RUNTIME_ISSUE_REMEDIATION: Record<RuntimeIssueType, string> = {
+  INVALID_TARGET:
+    'Check the --path value: it must point to an existing file or directory. Use an absolute path, or a path relative to the current working directory.',
+  PARSE_FAILURE:
+    'The file could not be parsed as TypeScript/JavaScript. Fix the syntax error at the reported location, or exclude generated/vendored files from the scan (they are skipped past 5 MB automatically). Non-TS/JS files should not be passed to --path.',
+  DETECTOR_FAILURE:
+    'A detector threw on this file — the rest of the scan continued. Re-run with --verbose to capture the stack, and please report the file shape so the detector can be hardened. The file was only partially analyzed.',
+  POC_EXPORT_FAILURE:
+    'The proof-of-concept export could not be written. Verify the output directory is writable and has free disk space.',
+  REPORT_WRITE_FAILURE:
+    'The report file could not be written. Verify the --output directory exists / is writable, or omit --output to write to the default location.',
+  FATAL_ANALYSIS_FAILURE:
+    'Analysis aborted before completing. Re-run with --verbose for the stack trace; if it reproduces, narrow --path to isolate the offending file.',
+};
+
 export class JSONReporter {
+  /** Actionable fix text for a runtime-issue type. Public so the CLI can surface it too. */
+  static remediationFor(type: RuntimeIssueType): string {
+    return RUNTIME_ISSUE_REMEDIATION[type] ?? 'Re-run with --verbose for more detail.';
+  }
+
   static generateReport(
     findings: Finding[],
     filesAnalyzed: number,
@@ -114,6 +140,16 @@ export class JSONReporter {
         findingsByCategory: report.findingsByCategory,
         findingsBySeverity: report.findingsBySeverity,
         runtimeIssues: report.runtimeIssuesByType,
+        // Surface each scan error with an actionable fix so JSON-log consumers (CI dashboards)
+        // can render remediation, not just a count.
+        runtimeIssueDetails: report.runtimeIssues.map((issue) => ({
+          type: issue.type,
+          severity: issue.severity,
+          message: issue.message,
+          file: issue.file,
+          detector: issue.detector,
+          fix: this.remediationFor(issue.type),
+        })),
       });
       return;
     }
@@ -146,7 +182,22 @@ export class JSONReporter {
     }
 
     if (report.runtimeIssues.length > 0) {
-      Logger.warn(`Runtime issues: ${report.runtimeIssues.length}`);
+      const errorCount = report.runtimeIssues.filter((issue) => issue.severity === 'ERROR').length;
+      const warnCount = report.runtimeIssues.length - errorCount;
+      Logger.warn(
+        `\nScan Errors & Warnings: ${report.runtimeIssues.length} (${errorCount} error${errorCount === 1 ? '' : 's'}, ${warnCount} warning${warnCount === 1 ? '' : 's'})`
+      );
+      report.runtimeIssues.forEach((issue, index) => {
+        const log = issue.severity === 'ERROR' ? Logger.error.bind(Logger) : Logger.warn.bind(Logger);
+        const where = [issue.file, issue.detector ? `detector: ${issue.detector}` : undefined]
+          .filter(Boolean)
+          .join('  ');
+        log(`\n${index + 1}. [${issue.severity}] ${issue.type}`);
+        log(`   What:  ${issue.message}`);
+        if (where) log(`   Where: ${where}`);
+        log(`   Fix:   ${this.remediationFor(issue.type)}`);
+      });
+      Logger.info('');
     }
 
     if (report.totalFindings > 0) {
@@ -197,6 +248,8 @@ export class JSONReporter {
         lines.push(
           `${index + 1}. [${issue.severity}] ${issue.type} - ${issue.message}${issue.file ? ` (${issue.file})` : ''}`
         );
+        if (issue.detector) lines.push(`   Detector: ${issue.detector}`);
+        lines.push(`   Fix: ${this.remediationFor(issue.type)}`);
       });
       lines.push('');
     }

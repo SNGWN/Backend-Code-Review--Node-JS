@@ -44,6 +44,23 @@ describe('InsecureTransportDetector', () => {
     expect(has(f, 'BCR-TLS-001')).toBe(true);
   });
 
+  test('BCR-TLS-001 fires on the falsy numeric variant rejectUnauthorized: 0', () => {
+    const f = scan('tls-zero.ts', `
+      import tls from 'tls';
+      export const s = tls.connect({ host: 'h', rejectUnauthorized: 0 });
+    `);
+    expect(has(f, 'BCR-TLS-001')).toBe(true);
+  });
+
+  test('BCR-TLS-001 does NOT fire when rejectUnauthorized is a non-literal (e.g. isProd)', () => {
+    const f = scan('tls-dynamic.ts', `
+      import https from 'https';
+      declare const isProd: boolean;
+      export const agent = new https.Agent({ rejectUnauthorized: isProd });
+    `);
+    expect(has(f, 'BCR-TLS-001')).toBe(false);
+  });
+
   test('BCR-TLS-001 does NOT fire when rejectUnauthorized is true', () => {
     const f = scan('tls-safe.ts', `
       import https from 'https';
