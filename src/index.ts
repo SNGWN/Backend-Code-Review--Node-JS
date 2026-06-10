@@ -81,6 +81,7 @@ function parseSeverityStrict(flagName: string, value: unknown, fallback?: Severi
   return normalized as Severity;
 }
 
+// bcr-disable-next-line BCR-BL-001 -- CLI entry point: sequential awaits in one process, no shared state to race
 export async function runCli(args = hideBin(process.argv)): Promise<number> {
   try {
     const argv = await yargs(args)
@@ -161,6 +162,10 @@ export async function runCli(args = hideBin(process.argv)): Promise<number> {
         describe: 'Skip TLS certificate verification for private-CA Kibana clusters.',
         type: 'boolean',
         default: false,
+      })
+      .option('proxy', {
+        describe: 'Forward proxy for Kibana/ES access (e.g. http://user:pass@proxy:8080). Env: HTTPS_PROXY / HTTP_PROXY; NO_PROXY is honored.',
+        type: 'string',
       })
       .option('output', {
         alias: 'o',
@@ -374,6 +379,44 @@ function parseTransport(value: unknown): KibanaTransport {
   return normalized as KibanaTransport;
 }
 
+/**
+ * Resolve the forward proxy for a target URL: explicit `--proxy` wins, then the standard
+ * HTTPS_PROXY / HTTP_PROXY env vars (matched to the target scheme, with lowercase variants).
+ * NO_PROXY (comma-separated host suffixes, `*` wildcard) disables the proxy for matching hosts.
+ */
+function resolveProxyUrl(flagValue: unknown, targetUrl: string | undefined): string | undefined {
+  const explicit = typeof flagValue === 'string' && flagValue.trim() ? flagValue.trim() : undefined;
+  let candidate = explicit;
+  let targetHost = '';
+  let targetIsHttps = true;
+  if (targetUrl) {
+    try {
+      const parsed = new URL(targetUrl);
+      targetHost = parsed.hostname.toLowerCase();
+      targetIsHttps = parsed.protocol === 'https:';
+    } catch {
+      /* unparseable target — env-proxy matching is skipped; explicit flag still applies */
+    }
+  }
+  if (!candidate) {
+    const env = process.env;
+    candidate = targetIsHttps
+      ? env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy
+      : env.HTTP_PROXY ?? env.http_proxy;
+    candidate = candidate?.trim() || undefined;
+    // NO_PROXY applies to env-derived proxies only — an explicit --proxy is an explicit choice.
+    if (candidate && targetHost) {
+      const noProxy = (env.NO_PROXY ?? env.no_proxy ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      for (const entry of noProxy) {
+        if (entry === '*') return undefined;
+        const suffix = entry.replace(/^\./, '');
+        if (targetHost === suffix || targetHost.endsWith(`.${suffix}`)) return undefined;
+      }
+    }
+  }
+  return candidate;
+}
+
 function envOrFlag(flagValue: unknown, envName: string): string | undefined {
   const flag = typeof flagValue === 'string' ? flagValue.trim() : undefined;
   if (flag) return flag;
@@ -396,6 +439,7 @@ interface LogReviewExecResult {
   getBaselineFindings: () => Parameters<typeof Baseline.write>[1];
 }
 
+// bcr-disable-next-line BCR-BL-001 -- CLI flow: sequential awaits against one ES client, no transactional state
 async function runLogReview(
   argv: Record<string, unknown>,
   shared: { includeHeuristics: boolean; minSeverity: Severity | undefined; disabledRules: string[] | undefined }
@@ -411,6 +455,7 @@ async function runLogReview(
   const transport = parseTransport(argv.transport);
   const maxHits = parsePositiveInt(argv['max-hits'], 50_000);
   const insecure = Boolean(argv.insecure);
+  const proxyUrl = resolveProxyUrl(argv.proxy, kibanaUrl);
 
   let password: string | undefined;
   let apiKeyId: string | undefined;
@@ -465,6 +510,9 @@ async function runLogReview(
   Logger.info(`🪵  Container: ${container}  on index ${logIndex}`);
   Logger.info(`⏱  Window: last ${days} days\n`);
 
+  if (proxyUrl) {
+    Logger.info(`🔀 Proxy : ${scrubCredentialsFromUrl(proxyUrl)}`);
+  }
   if (insecure) {
     Logger.warn('TLS certificate verification disabled (--insecure). Use only with trusted private CAs.');
   }
@@ -493,6 +541,7 @@ async function runLogReview(
     index: logIndex,
     containerField,
     rejectUnauthorized: !insecure,
+    proxyUrl,
     abortSignal: abortController.signal,
     onProgress: (hits) => {
       Logger.info(`  scanned ${hits.toLocaleString()} log entries…`);
@@ -551,6 +600,7 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
   const transport = parseTransport(argv.transport);
   const maxHits = parsePositiveInt(argv['max-hits'], 200);
   const insecure = Boolean(argv.insecure);
+  const proxyUrl = resolveProxyUrl(argv.proxy, kibanaUrl);
   const query = typeof argv.query === 'string' ? argv.query : '';
 
   let password: string | undefined;
@@ -606,6 +656,9 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
   Logger.info(`📂 Index : ${logIndex}${container ? `  Container: ${container}` : '  Container: (all)'}`);
   Logger.info(`⏱  Window: last ${days} days  (max ${maxHits} hits)\n`);
 
+  if (proxyUrl) {
+    Logger.info(`🔀 Proxy : ${scrubCredentialsFromUrl(proxyUrl)}`);
+  }
   if (insecure) {
     Logger.warn('TLS certificate verification disabled (--insecure).');
   }
@@ -627,6 +680,7 @@ async function runFreeTextSearch(argv: Record<string, unknown>): Promise<number>
     username, password, apiKeyId, apiKey, bearerToken,
     transport, index: logIndex, containerField,
     rejectUnauthorized: !insecure,
+    proxyUrl,
     abortSignal: abortController.signal,
     onProgress: (n) => Logger.info(`  matched ${n.toLocaleString()} hits so far…`),
   });

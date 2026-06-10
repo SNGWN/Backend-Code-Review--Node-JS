@@ -288,7 +288,15 @@ export const ruleLogTrackData: LogRule = (line) => {
   return out;
 };
 
-/** LOG-PII-001: UAE Emirates ID (784-YYYY-XXXXXXX-X). */
+/**
+ * LOG-PII-001: UAE Emirates ID (784-YYYY-XXXXXXX-X).
+ *
+ * Two-tier precision: the EID's final digit is a Luhn check digit over the full 15-digit
+ * number (ICA format). A shape + year + Luhn-valid match is reported HIGH (near-certain
+ * real EID); a shape + year match that FAILS Luhn is still reported (compliance recall —
+ * never silently drop a possible national ID) but demoted to MEDIUM with a verify hint,
+ * since it may be a random 784-prefixed number (timestamps, order ids).
+ */
 export const ruleLogEmiratesId: LogRule = (line) => {
   const out: LogRuleMatch[] = [];
   // Accept hyphens or no separators.
@@ -298,12 +306,15 @@ export const ruleLogEmiratesId: LogRule = (line) => {
   while ((match = pattern.exec(line)) !== null) {
     const year = parseInt(match[1], 10);
     if (year < 1900 || year > currentYear) continue;
+    const luhnValid = passesLuhn(match[0].replace(/[- ]/g, ''));
     out.push({
       ruleId: 'LOG-PII-001',
       title: 'UAE Emirates ID in log message',
-      description: `An Emirates ID (year ${year}) appears in this log line.`,
-      recommendation: 'Hash or pseudonymise the Emirates ID before logging. UAE PDPL Article 24.',
-      severity: 'HIGH',
+      description: luhnValid
+        ? `A checksum-valid Emirates ID (birth year ${year}) appears in this log line. UAE PDPL Art. 4/5 (lawful processing & data minimisation) and CBUAE Consumer Protection Standard 5.1 apply; logs count as storage.`
+        : `An Emirates-ID-shaped number (birth year ${year}) appears in this log line, but its Luhn check digit does not validate — verify whether this is a real EID or an unrelated 784-prefixed number.`,
+      recommendation: 'Hash or pseudonymise the Emirates ID at the application layer before logging. Restrict access to historical log volumes that contain it (UAE PDPL Art. 24 data-security obligation).',
+      severity: luhnValid ? 'HIGH' : 'MEDIUM',
       category: 'LOG_PII',
       start: match.index,
       end: match.index + match[0].length,

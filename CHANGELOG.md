@@ -6,6 +6,33 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
+### Added — Restricted-network access for log review (proxy / redirects / private CAs)
+- `--proxy` flag (env fallback `HTTPS_PROXY` / `HTTP_PROXY`, with `NO_PROXY` host-suffix
+  support) for both `--mode logs` and `--mode search`. HTTPS targets tunnel via CONNECT;
+  plain-HTTP targets use absolute-URI forwarding. Proxy credentials ride in the URL
+  userinfo and are emitted only as `Proxy-Authorization` — banners and errors are scrubbed.
+- The Kibana/ES client now follows HTTP redirects (301/302/303/307/308, max 5 hops):
+  http→https upgrades, SSO gateways, and LB host canonicalization no longer fail opaquely.
+  `Authorization` is forwarded only on same-origin hops; cross-origin redirect targets never
+  receive the credential. Redirect loops fail fast with the scrubbed chain in the error.
+- `--insecure` (unverified certificates, private CAs) applies identically through proxy
+  tunnels: target-cert validation is controlled at the TLS layer above the CONNECT socket.
+
+### Changed — False-positive reduction
+- `BCR-CRYPTO-006` (timing-unsafe comparison) now matches the secret-name pattern against
+  the comparand's **terminal identifier** instead of its full text, skips PascalCase
+  enum/constant members (`ts.SyntaxKind.BarBarToken` no longer flags on `/token/`), and
+  skips presence/metadata comparisons (`token === undefined`, `sig.length === 64`,
+  `typeof token === 'string'`). Self-scan findings dropped 27 → 0.
+- `LOG-PII-001` (Emirates ID) adds Luhn check-digit validation as a precision tier:
+  checksum-valid → HIGH; shape-only match → still reported (compliance recall) but MEDIUM
+  with explicit verify wording. Descriptions now cite UAE PDPL Art. 4/5/24 and CBUAE CPS.
+
+### Removed — Dead code
+- `src/utils/constants.ts` trimmed from 13 exports to the 2 that detectors actually use
+  (`VALIDATION_LIBRARIES`, `HTTP_METHODS`); the other 11 had zero consumers and drifted
+  from the real detector logic.
+
 ### Added — Insecure transport & cookie-security detectors
 - New `InsecureTransportDetector`:
   - `BCR-TLS-001` TLS certificate validation disabled — `rejectUnauthorized: false` on any

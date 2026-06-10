@@ -428,6 +428,7 @@ export class JwtBypassDetector {
 
       // Look for cache[token] = decoded pattern
       if (
+        // bcr-disable-next-line BCR-JWT-007 -- detector's own pattern strings, not a JWT cache
         leftText.includes('cache') &&
         (rightText.includes('decode') || rightText.includes('jwt'))
       ) {

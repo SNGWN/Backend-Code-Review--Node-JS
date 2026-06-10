@@ -1,5 +1,6 @@
 import * as http from 'http';
 import * as https from 'https';
+import * as tls from 'tls';
 import { URL } from 'url';
 
 /**
@@ -9,6 +10,20 @@ import { URL } from 'url';
  */
 export function scrubCredentialsFromUrl(value: string): string {
   return value.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, '$1[REDACTED]@');
+}
+
+/**
+ * Decides whether the Authorization header may be sent to `targetUrl` when the client was
+ * configured for `baseUrl`. Same origin always forwards. A same-host http→https UPGRADE also
+ * forwards — LB/SSO gateways commonly answer plain-http requests with a 301 to the TLS endpoint,
+ * and stripping auth there would turn the redirect feature into a guaranteed 401. Never forwards
+ * on a downgrade (https→http) or to a different host.
+ */
+export function shouldForwardAuth(baseUrl: string, targetUrl: string): boolean {
+  const base = new URL(baseUrl);
+  const target = new URL(targetUrl);
+  if (base.origin === target.origin) return true;
+  return base.protocol === 'http:' && target.protocol === 'https:' && base.hostname === target.hostname;
 }
 
 /**
@@ -78,6 +93,20 @@ export interface KibanaClientConfig {
    * AbortSignal that can be used to interrupt long-running scans (e.g. for SIGINT).
    */
   abortSignal?: AbortSignal;
+  /**
+   * Forward proxy URL (e.g. `http://proxy.bank.ae:8080`, with optional Basic userinfo).
+   * Bank networks commonly require an egress proxy to reach Kibana/ES. HTTPS targets are
+   * tunneled via CONNECT; HTTP targets are forwarded as absolute-URI requests. When unset,
+   * connections are direct.
+   */
+  proxyUrl?: string;
+  /**
+   * Maximum redirect hops to follow (default 5). Kibana behind a load balancer / SSO
+   * gateway often answers 301/302/307/308 (http→https upgrade, trailing-slash, host
+   * canonicalization). Authorization is forwarded on same-origin hops and same-host
+   * http→https upgrades only — see `shouldForwardAuth`.
+   */
+  maxRedirects?: number;
 }
 
 export interface LogHit {
@@ -153,6 +182,9 @@ export class KibanaClient {
   private readonly requestTimeoutMs: number;
   private readonly onProgress: ((n: number) => void) | undefined;
   private readonly abortSignal: AbortSignal | undefined;
+  private readonly proxy: URL | null;
+  private readonly proxyAuthHeader: string | null;
+  private readonly maxRedirects: number;
   /** Reuse HTTP sockets across requests — pagination ships dozens of calls. */
   private readonly httpAgent: http.Agent;
   private readonly httpsAgent: https.Agent;
@@ -174,6 +206,35 @@ export class KibanaClient {
     this.requestTimeoutMs = config.requestTimeoutMs ?? 30_000;
     this.onProgress = config.onProgress;
     this.abortSignal = config.abortSignal;
+    this.maxRedirects = config.maxRedirects ?? 5;
+
+    if (config.proxyUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(config.proxyUrl);
+      } catch {
+        throw new Error(`Invalid proxy URL: ${scrubCredentialsFromUrl(config.proxyUrl)}`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`Proxy protocol must be http or https (got ${parsed.protocol})`);
+      }
+      this.proxy = parsed;
+      // Proxy credentials ride in the URL userinfo; build the Proxy-Authorization header once
+      // and never keep the raw values around.
+      this.proxyAuthHeader = parsed.username
+        ? `Basic ${Buffer.from(
+            `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`,
+            'utf-8'
+          ).toString('base64')}`
+        : null;
+      // Strip the credential from the stored URL object — it lives on only inside the prebuilt
+      // header, so heap snapshots / debug dumps of the client never carry the raw password.
+      parsed.username = '';
+      parsed.password = '';
+    } else {
+      this.proxy = null;
+      this.proxyAuthHeader = null;
+    }
 
     // Build the auth header once; never store password as a property after this point.
     if (config.bearerToken) {
@@ -523,18 +584,73 @@ export class KibanaClient {
     throw lastError ?? new Error('Request failed after retries');
   }
 
-  private request(method: string, urlString: string, body?: unknown): Promise<{ status: number; body: string }> {
+  /**
+   * Issue a request, following HTTP redirects up to `maxRedirects` hops.
+   *
+   * Redirect semantics:
+   *   - 301 / 302 / 303 on POST → re-issue as GET without the body (de-facto client behavior;
+   *     303 mandates it). 307 / 308 preserve method + body.
+   *   - The Authorization header is forwarded only when `shouldForwardAuth` allows it:
+   *     same origin, or a same-host http→https upgrade. A true cross-origin redirect
+   *     (different host, or a TLS downgrade) never receives the Kibana/ES credential.
+   *   - Redirect loops / over-long chains fail with the (credential-scrubbed) chain in the error.
+   */
+  private async request(method: string, urlString: string, body?: unknown): Promise<{ status: number; body: string }> {
+    let currentMethod = method;
+    let currentUrl = urlString;
+    let currentBody = body;
+    const visited: string[] = [];
+
+    for (let hop = 0; hop <= this.maxRedirects; hop++) {
+      const forwardAuth = shouldForwardAuth(this.baseUrl, currentUrl);
+      const result = await this.requestOnce(currentMethod, currentUrl, currentBody, forwardAuth);
+
+      const isRedirect =
+        result.status === 301 || result.status === 302 || result.status === 303 ||
+        result.status === 307 || result.status === 308;
+      if (!isRedirect) return result;
+
+      const location = result.headers.location;
+      if (!location) return result; // Redirect with no Location — surface as-is.
+
+      visited.push(currentUrl);
+      const nextUrl = new URL(location, currentUrl).toString();
+      if (visited.includes(nextUrl)) {
+        throw new Error(`Redirect loop detected: ${visited.map(scrubCredentialsFromUrl).join(' -> ')}`);
+      }
+      if (hop === this.maxRedirects) {
+        throw new Error(
+          `Too many redirects (> ${this.maxRedirects}): ${[...visited, nextUrl].map(scrubCredentialsFromUrl).join(' -> ')}`
+        );
+      }
+      // 303 always becomes GET; 301/302 on POST follow the same de-facto rule.
+      if (result.status === 303 || ((result.status === 301 || result.status === 302) && currentMethod === 'POST')) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+      }
+      currentUrl = nextUrl;
+    }
+    throw new Error('Unreachable: redirect loop guard');
+  }
+
+  private requestOnce(
+    method: string,
+    urlString: string,
+    body: unknown,
+    includeAuth: boolean
+  ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
     return new Promise((resolve, reject) => {
       const url = new URL(urlString);
-      const lib = url.protocol === 'https:' ? https : http;
+      const isHttps = url.protocol === 'https:';
       const payload = body !== undefined ? Buffer.from(JSON.stringify(body), 'utf-8') : undefined;
 
       const headers: Record<string, string> = {
         Accept: 'application/json',
-        Authorization: this.authHeader,
         'User-Agent': 'backend-code-review/1.0 (log-review)',
         Connection: 'keep-alive',
       };
+      // Cross-origin redirect targets never receive the credential.
+      if (includeAuth) headers.Authorization = this.authHeader;
       if (payload) {
         headers['Content-Type'] = 'application/json';
         headers['Content-Length'] = String(payload.length);
@@ -544,18 +660,8 @@ export class KibanaClient {
         headers['kbn-xsrf'] = 'true';
       }
 
-      const requestOptions: http.RequestOptions = {
-        method,
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
-        headers,
-        timeout: this.requestTimeoutMs,
-        agent: lib === https ? this.httpsAgent : this.httpAgent,
-      };
-
-      const request = lib.request(requestOptions, (response) => {
+      const targetPort = Number(url.port || (isHttps ? 443 : 80));
+      const handleResponse = (request: http.ClientRequest) => (response: http.IncomingMessage): void => {
         const chunks: Buffer[] = [];
         let received = 0;
         // Cap the buffered response. A compromised/hostile upstream (or an LB serving a huge error
@@ -574,18 +680,129 @@ export class KibanaClient {
         });
         response.on('end', () => {
           if (aborted) return;
-          const responseBody = Buffer.concat(chunks).toString('utf-8');
-          resolve({ status: response.statusCode ?? 0, body: responseBody });
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf-8'),
+            headers: response.headers,
+          });
         });
+      };
+
+      const arm = (request: http.ClientRequest): void => {
+        request.on('timeout', () => {
+          request.destroy(new Error(`Request timed out after ${this.requestTimeoutMs}ms`));
+        });
+        request.on('error', reject);
+        if (payload) request.write(payload);
+        request.end();
+      };
+
+      if (this.proxy && isHttps) {
+        // HTTPS via forward proxy: CONNECT tunnel, then TLS over the established socket.
+        // rejectUnauthorized (--insecure) applies to the TARGET's certificate exactly as in
+        // the direct path; the proxy hop itself carries no TLS payload to validate here.
+        this.openProxyTunnel(url.hostname, targetPort)
+          .then((socket) => {
+            const request = https.request(
+              {
+                method,
+                hostname: url.hostname,
+                port: targetPort,
+                path: url.pathname + url.search,
+                headers,
+                timeout: this.requestTimeoutMs,
+                agent: false,
+                createConnection: () =>
+                  tls.connect({
+                    socket,
+                    servername: url.hostname,
+                    rejectUnauthorized: this.rejectUnauthorized,
+                  }),
+              },
+              // The handler needs the request to destroy on over-size; bind after creation.
+              (response) => handleResponse(request)(response)
+            );
+            arm(request);
+          })
+          .catch(reject);
+        return;
+      }
+
+      if (this.proxy && !isHttps) {
+        // Plain-HTTP via forward proxy: absolute-URI request to the proxy.
+        const proxyHeaders: Record<string, string> = { ...headers, Host: url.host };
+        if (this.proxyAuthHeader) proxyHeaders['Proxy-Authorization'] = this.proxyAuthHeader;
+        const lib = this.proxy.protocol === 'https:' ? https : http;
+        const request = lib.request(
+          {
+            method,
+            hostname: this.proxy.hostname,
+            port: Number(this.proxy.port || (this.proxy.protocol === 'https:' ? 443 : 80)),
+            path: urlString,
+            headers: proxyHeaders,
+            timeout: this.requestTimeoutMs,
+          },
+          (response) => handleResponse(request)(response)
+        );
+        arm(request);
+        return;
+      }
+
+      // Direct (no proxy) path — keep-alive agents reused across pagination calls.
+      const lib = isHttps ? https : http;
+      const request = lib.request(
+        {
+          method,
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: targetPort,
+          path: url.pathname + url.search,
+          headers,
+          timeout: this.requestTimeoutMs,
+          agent: isHttps ? this.httpsAgent : this.httpAgent,
+        },
+        (response) => handleResponse(request)(response)
+      );
+      arm(request);
+    });
+  }
+
+  /**
+   * Establish a CONNECT tunnel through the forward proxy to `host:port`.
+   * Resolves with the raw socket once the proxy answers 200; the caller layers TLS on top.
+   */
+  private openProxyTunnel(host: string, port: number): Promise<import('net').Socket> {
+    return new Promise((resolve, reject) => {
+      const proxy = this.proxy as URL;
+      const connectHeaders: Record<string, string> = { Host: `${host}:${port}` };
+      if (this.proxyAuthHeader) connectHeaders['Proxy-Authorization'] = this.proxyAuthHeader;
+
+      const lib = proxy.protocol === 'https:' ? https : http;
+      const connectReq = lib.request({
+        method: 'CONNECT',
+        hostname: proxy.hostname,
+        port: Number(proxy.port || (proxy.protocol === 'https:' ? 443 : 80)),
+        path: `${host}:${port}`,
+        headers: connectHeaders,
+        timeout: this.requestTimeoutMs,
       });
-      request.on('timeout', () => {
-        request.destroy(new Error(`Request timed out after ${this.requestTimeoutMs}ms`));
+      connectReq.on('connect', (response, socket) => {
+        if (response.statusCode === 200) {
+          resolve(socket);
+        } else {
+          socket.destroy();
+          reject(new Error(
+            `Proxy CONNECT to ${host}:${port} failed: HTTP ${response.statusCode}${response.statusCode === 407 ? ' (proxy auth required — pass credentials in the proxy URL: http://user:pass@proxy:port)' : ''}`
+          ));
+        }
       });
-      request.on('error', (error) => {
-        reject(error);
+      connectReq.on('timeout', () => {
+        connectReq.destroy(new Error(`Proxy CONNECT timed out after ${this.requestTimeoutMs}ms`));
       });
-      if (payload) request.write(payload);
-      request.end();
+      connectReq.on('error', (error) => {
+        reject(new Error(`Proxy connection failed (${scrubCredentialsFromUrl(proxy.href)}): ${error.message}`));
+      });
+      connectReq.end();
     });
   }
 
