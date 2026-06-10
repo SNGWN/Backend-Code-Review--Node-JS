@@ -930,6 +930,62 @@ const RULES: RuleDefinition[] = [
     recommendation: 'Use crypto.randomBytes() / crypto.randomUUID() for any identifier carrying security weight.',
   },
 
+  // ── INSECURE TRANSPORT / TLS ───────────────────────────────────────────────
+  {
+    id: 'BCR-TLS-001',
+    title: 'TLS Certificate Validation Disabled (rejectUnauthorized: false)',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'CRITICAL',
+    cwe: ['CWE-295'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'An HTTPS/TLS options object sets `rejectUnauthorized: false`, accepting any certificate (self-signed, expired, or attacker-forged). The connection is no longer authenticated and is open to man-in-the-middle interception. Read by https.request/https.Agent/tls.connect and forwarded by axios/got/node-fetch/request agents.',
+    recommendation: 'Remove `rejectUnauthorized: false`. To trust a private CA, pass it via the `ca` option instead of disabling validation.',
+  },
+  {
+    id: 'BCR-TLS-002',
+    title: 'Global TLS Verification Disabled via NODE_TLS_REJECT_UNAUTHORIZED',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'CRITICAL',
+    cwe: ['CWE-295'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'Setting `process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"` disables certificate validation for EVERY TLS connection in the process. Any outbound HTTPS request can be silently man-in-the-middled.',
+    recommendation: 'Never set NODE_TLS_REJECT_UNAUTHORIZED to 0. Trust a specific private CA via the `ca` option on the individual client and keep validation enabled everywhere.',
+  },
+
+  // ── COOKIE SECURITY FLAGS ──────────────────────────────────────────────────
+  {
+    id: 'BCR-COOKIE-001',
+    title: 'Session/Auth Cookie Without httpOnly Flag',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'HIGH',
+    cwe: ['CWE-1004'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'A session or authentication cookie is set with `httpOnly: false`, or left at the insecure `res.cookie()` default, making it readable from client-side JavaScript. A cross-site scripting flaw can then read the cookie and hijack the session.',
+    recommendation: 'Set `httpOnly: true` on session and authentication cookies so they are never exposed to document.cookie.',
+  },
+  {
+    id: 'BCR-COOKIE-002',
+    title: 'Session/Auth Cookie Without Secure Flag',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'MEDIUM',
+    cwe: ['CWE-614'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'A session or authentication cookie is set without the `secure` flag (or with `secure: false`), so the browser will transmit it over plaintext HTTP where a network attacker can capture it.',
+    recommendation: 'Set `secure: true` in production so session/auth cookies are only ever sent over HTTPS.',
+    heuristic: true,
+  },
+  {
+    id: 'BCR-COOKIE-003',
+    title: 'Session/Auth Cookie Without SameSite Attribute',
+    category: 'MISCONFIGURATION',
+    defaultSeverity: 'LOW',
+    cwe: ['CWE-1275'],
+    owasp: 'A05:2021 - Security Misconfiguration',
+    description: 'A session or authentication cookie is set without a `sameSite` attribute (or with `sameSite: "none"`), leaving it attached to cross-site requests and exposed to cross-site request forgery.',
+    recommendation: "Set `sameSite: 'lax'` (or `'strict'`) on session/auth cookies; pair `'none'` with `secure: true` only when cross-site use is required.",
+    heuristic: true,
+  },
+
   // ╔═══════════════════════════════════════════════════════════════════════╗
   // ║ LOG REVIEW RULES (mode=logs). Scoped to PCI-DSS / UAE PDPL / GDPR.    ║
   // ╚═══════════════════════════════════════════════════════════════════════╝

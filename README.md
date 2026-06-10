@@ -339,6 +339,12 @@ The default ruleset emits findings for:
   exclusion, DB connection strings
 - **Logging** — secrets in log payloads (excluding plain string-literal labels),
   log-injection via user input in templates
+- **Insecure Transport / TLS** — `rejectUnauthorized: false` on any HTTPS/TLS options
+  object (https.Agent / tls.connect / axios / got / node-fetch agents), and the
+  process-global `NODE_TLS_REJECT_UNAUTHORIZED = "0"` kill switch (both CWE-295 MITM)
+- **Cookie Security** — session/auth cookies set without `httpOnly` (XSS session theft),
+  `secure` (cleartext transmission), or `sameSite` (CSRF), across `res.cookie()`,
+  `express-session`, and `cookie-session`, with library-default-aware gating
 - **Cache Poisoning, Queue, Event Stream** — see rule catalog
 - **Data Exposure** — sensitive fields in response shapes
 

@@ -26,6 +26,8 @@ import { MessageQueueDetector } from './detectors/messageQueueDetector';
 import { EventStreamDetector } from './detectors/eventStreamDetector';
 import { SsrfDetector } from './detectors/ssrfDetector';
 import { MisconfigurationDetector } from './detectors/misconfigurationDetector';
+import { InsecureTransportDetector } from './detectors/insecureTransportDetector';
+import { CookieSecurityDetector } from './detectors/cookieSecurityDetector';
 import { FileHelper } from './utils/helpers';
 import { ProofOfConcept } from './poc/types';
 import { PocMarkdownReportGenerator } from './poc/PocMarkdownReportGenerator';
@@ -181,6 +183,14 @@ export class BackendCodeReviewAnalyzer {
     {
       name: 'MisconfigurationDetector',
       create: (filePath, sourceFile, parser, _pc) => new MisconfigurationDetector(filePath, sourceFile, parser),
+    },
+    {
+      name: 'InsecureTransportDetector',
+      create: (filePath, sourceFile, parser, _pc) => new InsecureTransportDetector(filePath, sourceFile, parser),
+    },
+    {
+      name: 'CookieSecurityDetector',
+      create: (filePath, sourceFile, parser, _pc) => new CookieSecurityDetector(filePath, sourceFile, parser),
     },
   ];
 
