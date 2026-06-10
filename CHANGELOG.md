@@ -4,6 +4,24 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — Insecure transport & cookie-security detectors
+- New `InsecureTransportDetector`:
+  - `BCR-TLS-001` TLS certificate validation disabled — `rejectUnauthorized: false` on any
+    HTTPS/TLS options object (https.Agent / tls.connect, and forwarded by axios/got/node-fetch/
+    request agents). CRITICAL, CWE-295 — reduces HTTPS to an unauthenticated, MITM-able channel.
+  - `BCR-TLS-002` Process-global TLS kill switch — `process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"`
+    (dot or bracket access). CRITICAL, CWE-295 — disables validation for every TLS connection.
+- New `CookieSecurityDetector` (understands `res.cookie()`, `express-session`, `cookie-session`):
+  - `BCR-COOKIE-001` Session/auth cookie without `httpOnly` (explicit `false`, or insecure
+    `res.cookie` default on a session/auth-named cookie). HIGH, CWE-1004.
+  - `BCR-COOKIE-002` Session/auth cookie without `secure` (heuristic). MEDIUM, CWE-614.
+  - `BCR-COOKIE-003` Session/auth cookie without `sameSite` / `sameSite: 'none'` (heuristic).
+    LOW, CWE-1275.
+  - Library-default-aware: a *missing* `httpOnly` is only flagged for `res.cookie` (insecure
+    default), not for `express-session` / `cookie-session` (which default to `httpOnly: true`).
+
 ## [1.3.0] — 2026-06-07
 
 ### Added — Framework-architecture awareness
