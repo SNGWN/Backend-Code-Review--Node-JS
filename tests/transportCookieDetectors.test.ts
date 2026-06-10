@@ -8,16 +8,30 @@ import { Finding } from '../src/types';
  * Coverage for the insecure-transport (TLS) and cookie-security detectors.
  */
 let counter = 0;
+const createdFiles: string[] = [];
 function scan(name: string, content: string): Finding[] {
   counter += 1;
   const filePath = path.join(os.tmpdir(), `bcr-tlscookie-${process.pid}-${counter}-${name}`);
   fs.writeFileSync(filePath, content, 'utf-8');
+  createdFiles.push(filePath);
   const report = new BackendCodeReviewAnalyzer().analyze(filePath, {
     includeHeuristics: true,
     minSeverity: 'LOW',
   });
   return report.findings;
 }
+
+// Don't leave bcr-tlscookie-* temp files behind — they accumulate in the OS temp dir
+// across runs and can pollute CI environments.
+afterAll(() => {
+  for (const file of createdFiles) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      /* already gone — ignore */
+    }
+  }
+});
 
 const has = (findings: Finding[], ruleId: string): boolean =>
   findings.some((f) => f.ruleId === ruleId);
@@ -141,6 +155,38 @@ describe('CookieSecurityDetector', () => {
       }
     `);
     expect(has(f, 'BCR-COOKIE-002')).toBe(true);
+  });
+
+  test('a dynamically-named cookie with no options does NOT fire (no false positive)', () => {
+    const f = scan('cookie-dynamic.ts', `
+      export function set(req: any, res: any, name: string) {
+        res.cookie(name, 'abc');
+      }
+    `);
+    expect(has(f, 'BCR-COOKIE-001')).toBe(false);
+    expect(has(f, 'BCR-COOKIE-002')).toBe(false);
+    expect(has(f, 'BCR-COOKIE-003')).toBe(false);
+  });
+
+  test('a dynamically-named cookie with explicit httpOnly: false still fires', () => {
+    const f = scan('cookie-dynamic-false.ts', `
+      export function set(req: any, res: any, name: string) {
+        res.cookie(name, 'abc', { httpOnly: false });
+      }
+    `);
+    expect(has(f, 'BCR-COOKIE-001')).toBe(true);
+  });
+
+  test('sameSite: false is treated as absent (TENTATIVE), not none (FIRM)', () => {
+    const f = scan('cookie-samesite-false.ts', `
+      export function login(req: any, res: any) {
+        res.cookie('session', 'abc', { httpOnly: true, secure: true, sameSite: false });
+      }
+    `);
+    const finding = f.find((x) => x.ruleId === 'BCR-COOKIE-003');
+    expect(finding).toBeDefined();
+    expect(finding?.confidence).toBe('TENTATIVE');
+    expect(finding?.description).toMatch(/without a .sameSite. attribute/i);
   });
 
   test('BCR-COOKIE-003 fires on sameSite: none', () => {

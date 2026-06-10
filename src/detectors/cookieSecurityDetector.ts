@@ -60,7 +60,10 @@ export class CookieSecurityDetector {
 
     const nameArg = call.arguments[0];
     const cookieName = nameArg && ts.isStringLiteralLike(nameArg) ? nameArg.text : '';
-    const sensitive = !cookieName || CookieSecurityDetector.SENSITIVE_COOKIE.test(cookieName);
+    // Only a *known* session/auth-shaped name is "sensitive". A dynamic/non-literal name
+    // (`res.cookie(nameVar, …)`) is treated as NOT sensitive — otherwise every dynamically
+    // named cookie would be flagged for a missing flag, a large false-positive class.
+    const sensitive = cookieName !== '' && CookieSecurityDetector.SENSITIVE_COOKIE.test(cookieName);
 
     const opts = call.arguments[2];
     const options = opts && ts.isObjectLiteralExpression(opts) ? opts : undefined;
@@ -197,7 +200,8 @@ export class CookieSecurityDetector {
       if (this.propName(prop.name) !== 'sameSite') continue;
       const init = prop.initializer;
       if (ts.isStringLiteralLike(init)) return init.text.toLowerCase() === 'none' ? 'none' : 'set';
-      if (init.kind === ts.SyntaxKind.FalseKeyword) return 'none';
+      // `sameSite: false` means "do not emit a SameSite attribute" — i.e. absent, not 'none'.
+      if (init.kind === ts.SyntaxKind.FalseKeyword) return 'absent';
       return 'set';
     }
     return 'absent';
