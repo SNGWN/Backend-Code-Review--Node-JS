@@ -95,6 +95,17 @@ describe('Emirates ID rule (LOG-PII-001)', () => {
     expect(ruleLogEmiratesId('id=784199012345678').length).toBe(1);
   });
 
+  test('Luhn-valid EID reports HIGH; checksum-failed EID demotes to MEDIUM with verify wording', () => {
+    const valid = ruleLogEmiratesId('eid=784199012345676 verified');
+    expect(valid.length).toBe(1);
+    expect(valid[0].severity).toBe('HIGH');
+
+    const invalid = ruleLogEmiratesId('eid=784199012345678 verified');
+    expect(invalid.length).toBe(1);
+    expect(invalid[0].severity).toBe('MEDIUM');
+    expect(invalid[0].description).toMatch(/Luhn check digit does not validate/);
+  });
+
   test('does NOT fire on patterns that fail the year-range sanity', () => {
     expect(ruleLogEmiratesId('784-9999-1234567-8').length).toBe(0);
   });

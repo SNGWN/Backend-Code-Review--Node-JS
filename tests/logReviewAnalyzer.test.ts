@@ -54,7 +54,8 @@ describe('LogReviewAnalyzer', () => {
     const client = new FakeKibanaClient([
       hit({ _id: 'a', message: 'customer payment failed for card 4242424242424242 amount 100' }),
       hit({ _id: 'b', message: 'cvv=123 retry' }),
-      hit({ _id: 'c', message: 'customer 784-1990-1234567-8 verified' }),
+      // Luhn-valid EID (the rule demotes checksum-failed shapes to MEDIUM).
+      hit({ _id: 'c', message: 'customer 784-1990-1234567-6 verified' }),
     ]);
 
     const report = await new LogReviewAnalyzer(client).analyze(baseOptions);
@@ -67,7 +68,7 @@ describe('LogReviewAnalyzer', () => {
     // No finding should ever carry the unmasked PAN / CVV / Emirates ID in any field.
     const allText = JSON.stringify(report);
     expect(allText).not.toContain('4242424242424242');
-    expect(allText).not.toContain('784-1990-1234567-8');
+    expect(allText).not.toContain('784-1990-1234567-6');
   });
 
   test('dedups identical findings across repeated log lines', async () => {

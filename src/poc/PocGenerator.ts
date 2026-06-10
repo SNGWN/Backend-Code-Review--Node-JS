@@ -293,6 +293,7 @@ export abstract class PocGenerator {
    */
   protected getRemediationTemplate(vulnerabilityType: string): string {
     const templates: { [key: string]: string } = {
+      // bcr-disable-next-line BCR-AUTH-002 -- documentation template: the "secret" is an illustrative placeholder in remediation text, not a credential
       'hardcoded-secret': `// ❌ VULNERABLE: Hardcoded secret
 const API_KEY = 'sk-xxxxxxxxxxxxx';
 

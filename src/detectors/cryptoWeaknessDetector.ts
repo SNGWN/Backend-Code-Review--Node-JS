@@ -45,14 +45,22 @@ export class CryptoWeaknessDetector {
       return;
     }
     const SECRET_NAME = /signature|\bsig\b|hmac|digest|\bmac\b|\bhash\b|token|secret|otp|\bnonce\b|csrf|checksum|expectedhash|computedhash/i;
-    const leftText = node.left.getText(this.sourceFile);
-    const rightText = node.right.getText(this.sourceFile);
-    const leftSecret = SECRET_NAME.test(leftText);
-    const rightSecret = SECRET_NAME.test(rightText);
+
+    // Presence/metadata checks are not secret comparisons:
+    //   token === undefined / null / 0 / true  → presence check
+    //   sig.length === 64                      → length check
+    //   typeof token === 'string'              → type check
+    if (this.isNonValueComparand(node.left) || this.isNonValueComparand(node.right)) return;
+
+    // Match the secret-name pattern against the TERMINAL identifier of each side, not the full
+    // text. Full-text matching flagged enum/metadata comparisons wholesale — e.g.
+    // `node.operatorToken.kind === ts.SyntaxKind.BarBarToken` matched /token/i twice.
+    const leftSecret = this.comparandLooksSecret(node.left, SECRET_NAME);
+    const rightSecret = this.comparandLooksSecret(node.right, SECRET_NAME);
     if (!leftSecret && !rightSecret) return;
 
-    // A literal string on one side (`x === 'true'`) is not a secret comparison; skip.
-    if (ts.isStringLiteral(node.left) || ts.isStringLiteral(node.right)) return;
+    const leftText = node.left.getText(this.sourceFile);
+    const rightText = node.right.getText(this.sourceFile);
 
     // Stronger signal when one side is a crypto computation (createHmac/digest/sign).
     const computed = /createHmac|createHash|\.digest\(|\.sign\(|crypto\./i.test(leftText + rightText);
@@ -71,6 +79,69 @@ export class CryptoWeaknessDetector {
       code: node.getText(this.sourceFile).substring(0, 120),
       recommendation: 'Use crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)) after a length check, or a library verify() (e.g. stripe.webhooks.constructEvent).',
     });
+  }
+
+  /**
+   * True when the expression cannot be the secret side of a value comparison: literals
+   * (string/number/boolean), null/undefined, `typeof x`, or `.length` / `.kind` / `.type` /
+   * `.status` metadata reads. Comparing a secret-named variable against these is a presence,
+   * length, or discriminant check — not a byte-wise secret comparison.
+   */
+  private isNonValueComparand(expr: ts.Expression): boolean {
+    const unwrapped = this.unwrap(expr);
+    if (
+      ts.isStringLiteralLike(unwrapped) ||
+      ts.isNumericLiteral(unwrapped) ||
+      unwrapped.kind === ts.SyntaxKind.TrueKeyword ||
+      unwrapped.kind === ts.SyntaxKind.FalseKeyword ||
+      unwrapped.kind === ts.SyntaxKind.NullKeyword ||
+      (ts.isIdentifier(unwrapped) && unwrapped.text === 'undefined') ||
+      ts.isTypeOfExpression(unwrapped)
+    ) {
+      return true;
+    }
+    if (ts.isPropertyAccessExpression(unwrapped) && /^(length|kind|type|status|statusCode|size|count)$/.test(unwrapped.name.text)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Evaluates the secret-name pattern against the comparand's terminal identifier:
+   * `req.headers['x-signature']` → `x-signature`; `expected.digest('hex')` → `digest`;
+   * `ts.SyntaxKind.BarBarToken` → skipped (PascalCase terminal = enum/constant member,
+   * not secret material — secrets are camelCase/lowercase bindings in practice).
+   */
+  private comparandLooksSecret(expr: ts.Expression, pattern: RegExp): boolean {
+    const terminal = this.terminalName(this.unwrap(expr));
+    if (!terminal) return false;
+    if (/^[A-Z]/.test(terminal) && !/^[A-Z0-9_]+$/.test(terminal)) return false; // PascalCase enum member
+    return pattern.test(terminal);
+  }
+
+  /** Terminal (rightmost) name of an expression chain, or null when there is none. */
+  private terminalName(expr: ts.Expression): string | null {
+    if (ts.isIdentifier(expr)) return expr.text;
+    if (ts.isPropertyAccessExpression(expr)) return expr.name.text;
+    if (ts.isElementAccessExpression(expr)) {
+      const arg = expr.argumentExpression;
+      return ts.isStringLiteralLike(arg) ? arg.text : null;
+    }
+    if (ts.isCallExpression(expr)) return this.terminalName(expr.expression as ts.Expression);
+    if (ts.isAwaitExpression(expr)) return this.terminalName(expr.expression);
+    return null;
+  }
+
+  private unwrap(expr: ts.Expression): ts.Expression {
+    let current = expr;
+    while (
+      ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isNonNullExpression(current)
+    ) {
+      current = current.expression;
+    }
+    return current;
   }
 
   private checkWeakHashing(node: ts.CallExpression): void {

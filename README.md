@@ -122,10 +122,41 @@ Log-review inputs (flag → env var fallback):
 | `--transport` | — | no | `kibana-proxy` (default) or `direct` |
 | `--max-hits` | — | no | Safety cap (default 50000) |
 | `--insecure` | — | no | Skip TLS verification (private CA only) |
+| `--proxy` | `HTTPS_PROXY` / `HTTP_PROXY` | no | Forward proxy; `NO_PROXY` honored |
+
+#### Restricted-network access (proxy, redirects, private CAs)
+
+Bank and enterprise networks rarely expose Kibana directly. The client handles the
+three common obstacles without extra tooling:
+
+- **Forward proxy** — pass `--proxy http://proxy.bank.ae:8080` (or rely on the standard
+  `HTTPS_PROXY` / `HTTP_PROXY` env vars; `NO_PROXY` host suffixes are honored for
+  env-derived proxies). HTTPS targets are tunneled with CONNECT; proxy credentials go
+  in the URL userinfo (`http://user:pass@proxy:8080`) and are sent as
+  `Proxy-Authorization`, never logged.
+- **Redirects** — 301/302/303/307/308 chains (http→https upgrades, SSO gateways, host
+  canonicalization) are followed up to 5 hops. The `Authorization` header is forwarded
+  **only on same-origin hops** — a redirect to a different host never receives the
+  Kibana credential. Loops fail fast with the (credential-scrubbed) chain in the error.
+- **Private CAs / unverified certificates** — `--insecure` disables target-certificate
+  validation (it applies identically through a proxy tunnel). Use it only for trusted
+  private-CA clusters; the scanner warns loudly when active.
 
 Log rules ship with PCI-DSS / UAE PDPL / OWASP-A09 mapping. The `--list-rules` output
 shows the full catalog including `LOG-*` rules with CWE references (CWE-532, CWE-359,
 CWE-256, etc.).
+
+#### UAE compliance specifics
+
+- **Emirates ID** (`LOG-PII-001`) is validated in two tiers: shape + birth-year sanity
+  + **Luhn check digit** → HIGH (near-certain real EID); a shape match whose checksum
+  fails is still reported (recall matters for national IDs) but demoted to MEDIUM with
+  explicit verify wording. Findings reference UAE PDPL Art. 4/5/24 and CBUAE Consumer
+  Protection Standards.
+- **UAE IBAN** (`LOG-PII-002`) — full ISO 13616 mod-97 validation, AE and foreign IBANs.
+- **UAE phone numbers** (`LOG-PII-004`) — `+971` and `05X` local formats.
+- Excerpts in findings are **always redacted** — the report itself can never become the
+  PCI/PDPL leak.
 
 ### Free-text search (`--mode search`)
 
@@ -159,6 +190,7 @@ Search inputs:
 | `--days` | `LOG_REVIEW_DAYS` | no | Default 7 for search |
 | `--max-hits` | — | no | Default 200 |
 | `--log-index` | `LOG_INDEX` | no | Default `*` (search-mode default) |
+| `--proxy` | `HTTPS_PROXY` / `HTTP_PROXY` | no | Forward proxy; `NO_PROXY` honored |
 
 The matched query term is **redacted in the output** — reviewers can locate WHERE the
 term appears without the artifact itself becoming a leak.

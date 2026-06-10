@@ -65,3 +65,21 @@ export {
   rawValue,
   deleteCacheKey,
 };
+
+// (7) Enum / metadata comparisons whose member names contain "Token"/"kind" must NOT
+// flag as timing-unsafe secret comparison (BCR-CRYPTO-006). This is exactly the shape
+// of TypeScript-AST tooling code.
+enum SyntaxishKind { BarBarToken, QuestionQuestionToken }
+interface Nodeish { operatorToken: { kind: SyntaxishKind } }
+export function isBarBar(node: Nodeish): boolean {
+  return node.operatorToken.kind === SyntaxishKind.BarBarToken;
+}
+
+// (8) Presence / length / type checks on secret-named values are not byte-wise
+// secret comparisons.
+export function tokenChecks(token: string | undefined, sig: string, expected: string): boolean {
+  if (token === undefined) return false;
+  if (typeof token === 'string' && token.length === 0) return false;
+  if (sig.length !== expected.length) return false;
+  return true;
+}
